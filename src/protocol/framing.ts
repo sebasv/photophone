@@ -258,6 +258,29 @@ export interface Point {
   y: number;
 }
 
+export interface FiducialDetectionBounds {
+  /** Minimum pixel count for a marker cluster. */
+  minClusterPixels: number;
+  /** Maximum pixel count for a marker cluster. */
+  maxClusterPixels: number;
+}
+
+/**
+ * Convenience: derive detection bounds from a known canonical cell size.
+ * Used by tests where the image dimensions are controlled. Real receivers
+ * processing a camera frame should pass image-size-derived bounds because
+ * the apparent fiducial size depends on how the sender is framed.
+ */
+export function detectionBoundsForCellSize(
+  cellSizePx: number,
+): FiducialDetectionBounds {
+  const expected = cellSizePx * cellSizePx * 4; // inner 2×2 marker = 4 cells
+  return {
+    minClusterPixels: expected / 8,
+    maxClusterPixels: expected * 9,
+  };
+}
+
 /**
  * Find the four fiducial centroids in an image. Returns null if detection
  * fails (e.g., < 4 candidate clusters survive filtering).
@@ -268,17 +291,13 @@ export interface Point {
  */
 export function detectFiducials(
   img: RawImage,
-  expectedClusterSizePx: number,
+  bounds: FiducialDetectionBounds,
 ): [Point, Point, Point, Point] | null {
   const components = findMarkerComponents(img);
-  // We expect each fiducial cluster to be ~`expectedClusterSizePx`² pixels;
-  // perspective warps can shrink one corner and grow another, so the filter
-  // is intentionally wide: 1/8× to 9× the expected area.
-  const expectedArea = expectedClusterSizePx * expectedClusterSizePx;
-  const minArea = expectedArea / 8;
-  const maxArea = expectedArea * 9;
   const filtered = components.filter(
-    (c) => c.pixelCount >= minArea && c.pixelCount <= maxArea,
+    (c) =>
+      c.pixelCount >= bounds.minClusterPixels &&
+      c.pixelCount <= bounds.maxClusterPixels,
   );
   if (filtered.length < 4) return null;
 
@@ -474,8 +493,10 @@ export function decodeFrameWarped(
   palette: Palette,
   img: RawImage,
   cellSizePx: number,
+  detection?: FiducialDetectionBounds,
 ): Uint8Array {
-  const fiducials = detectFiducials(img, cellSizePx * 2);
+  const bounds = detection ?? detectionBoundsForCellSize(cellSizePx);
+  const fiducials = detectFiducials(img, bounds);
   if (!fiducials) {
     throw new Error("decodeFrameWarped: fiducial detection failed");
   }

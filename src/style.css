@@ -163,9 +163,36 @@ button:disabled {
 }
 
 #frame-canvas,
-#camera-video {
+#camera-video,
+#capture-preview {
   display: block;
   width: 100%;
   height: auto;
   max-height: 75vh;
+}
+
+.stage--secondary {
+  min-height: 0;
+}
+
+.stage--secondary #capture-preview {
+  max-height: 40vh;
+}
+
+.output {
+  background: #0c0c0c;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 1rem;
+  overflow-x: auto;
+}
+
+.output pre {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-all;
 }

@@ -15,10 +15,17 @@
       </header>
       <section class="controls">
         <button id="start-camera">Start camera</button>
+        <button id="capture-frame" disabled>Capture frame</button>
         <span id="status" class="status">idle</span>
       </section>
       <section class="stage">
         <video id="camera-video" playsinline autoplay muted></video>
+      </section>
+      <section class="stage stage--secondary">
+        <canvas id="capture-preview"></canvas>
+      </section>
+      <section class="output">
+        <pre id="decoded-output">No capture yet.</pre>
       </section>
     </main>
     <script type="module" src="/src/pages/receive.ts"></script>
