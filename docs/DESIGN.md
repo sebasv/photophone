@@ -77,7 +77,31 @@ Concrete starting numbers. Geometry is a tunable knob — these are what we'll p
 - **Payload cells:** 4096 − 64 − 16 − 128 = **3888 cells**
 - **Palette:** 4 colours (black, red, green, blue) → 2 bits/cell → **972 bytes/frame raw**
 
-After ECC (8/4 Reed-Solomon = ~67% data efficiency) and a 16-byte packet header: roughly **633 bytes of application payload per frame**.
+After ECC (8/4 Reed-Solomon = ~67% data efficiency), a 16-byte packet header, and a 24-byte bootstrap region (see §4.1): roughly **609 bytes of application payload per frame** in unicast mode, and ~600 in broadcast mode (the fountain header adds a few bytes).
+
+### 4.1 Bootstrap metadata (broadcast & late-join)
+
+A small fixed region in **every frame** carries session bootstrap info so a receiver tuning in at any moment can sync. Embedding in every frame (rather than dedicated bootstrap frames every N) gives zero join latency at the cost of ~3% per-frame payload tax — a good trade for a primitive that's load-bearing for broadcast.
+
+**Frequent bootstrap region — 24 bytes per frame:**
+
+| Bytes | Field | Notes |
+| --- | --- | --- |
+| 4 | `session_id` | u32, random per transfer, prevents crosstalk |
+| 2 | `source_count` (K) | u16, total source packets in this session |
+| 4 | `payload_size` | u32, total bytes of the original payload |
+| 4 | `filename_hash` | first 4 bytes of sha256(filename) — for identification |
+| 1 | `mime_index` | small enum: 0=`application/octet-stream`, 1=`image/png`, … |
+| 1 | `extended_slot` | which extended-metadata slot is in this frame (0–3) |
+| 4 | `extended_data` | content of the slot, see below |
+| 4 | `bootstrap_crc32` | CRC32 over the preceding 20 bytes |
+
+**Extended metadata** — 4 bytes per frame, rotating through 4 slots:
+
+- Slot 0–7: full **sha256** of payload (32 bytes / 4 = 8 frame slots)
+- Slot 8–23: **filename** (UTF-8, up to 64 bytes / 4 = 16 frame slots)
+
+So a receiver assembles the full sha256 from 8 distinct frames and the filename from 16. At 10 fps that's 2.4 s worst-case to learn the full session identity. Until then it can already accumulate fountain packets — it just can't *verify* or *save* the result until extended metadata completes. The truncated `filename_hash` distinguishes simultaneously broadcast files.
 
 ### Sending `hello_world.png` (26,802 bytes)
 
@@ -123,9 +147,26 @@ Fixed-width header so the receiver can frame even with partial cell corruption.
 | 14 | 2 | payload_len | u16, bytes of payload that follow |
 | 16 | N | payload | application bytes |
 
-Total header: 16 bytes. Payload is whatever fits in the rest of the post-ECC frame.
+Total header: 16 bytes. Payload is whatever fits in the rest of the post-ECC frame after the bootstrap region.
 
-The **session** layer wraps the first packet's payload in a small struct: filename, mime type, total payload size in bytes, sha256. That lets the receiver name the saved file and verify the transfer.
+### 5.1 Encoded packet header (broadcast / fountain mode)
+
+When the transport mode is `broadcast-fec`, the sender doesn't emit source packets directly — it emits **encoded packets**, each a XOR combination of some source packets. These need an additional 4-byte prefix describing the combination:
+
+| Bytes | Field | Notes |
+| --- | --- | --- |
+| 1 | `degree` (d) | u8, how many source packets are XOR'd into this one |
+| 1 | `seed_hi` | u8, high byte of a 16-bit PRNG seed |
+| 1 | `seed_lo` | u8, low byte of the PRNG seed |
+| 1 | `reserved` | future use |
+
+The receiver re-derives the d source indices by seeding the same PRNG and drawing d values mod K. This avoids transmitting an explicit list of indices, which would otherwise cost `⌈log2(K)⌉ × d` bits per packet — significant at large K.
+
+The PRNG is **xorshift32** initialized from `seed`. K is known from the bootstrap region.
+
+### 5.2 Source packet header (unicast mode)
+
+Unchanged from §5 above. In unicast mode the packet that lands on screen *is* the source packet.
 
 ## 6. Reliability model
 
@@ -160,14 +201,19 @@ Properties that matter for Photophone:
 
 ## 7. Open questions
 
+### Decided
+
+- ✅ **Bootstrap cadence:** embed in every frame (§4.1). 24 frequent bytes + 4 rotating extended bytes = 28-byte tax per frame, ~3% overhead, zero join latency.
+- ✅ **Broadcast loop policy:** loop forever until manually stopped. Each extra encoded packet is free redundancy for receivers with worse channel conditions.
+- ✅ **Fountain header layout:** seeded PRNG (§5.1) rather than explicit index lists. 4 bytes per encoded packet regardless of K.
+
+### Still open
+
 - **Frame rate vs decode rate.** Most laptop screens refresh at 60 Hz; phone cameras capture at 30 fps with rolling shutter. We probably want sender ≤ camera fps, with a guard band. Empirical.
 - **Palette size.** 2 bits/cell is conservative. 3 bits (8 colours) and 4 bits (16) are tempting but degrade under bad lighting. Decide per-deployment via the handshake (unicast) or use a conservative default (broadcast).
-- **Bootstrap cadence.** Embed metadata in every frame (zero join latency, ~10% per-frame tax) or dedicate every Nth frame (no per-frame tax, up to N-frame join latency)? Leaning toward embed-in-every-frame given how small the metadata is.
-- **Broadcast loop policy.** Loop forever until manually stopped? Stop after K full loops? Forever feels right — fountain codes mean more time = more redundancy.
 - **Fountain code degree distribution.** LT codes need a well-chosen degree distribution (Robust Soliton is the textbook answer). Raptor codes wrap that with a pre-code for cleaner decode. Try both, measure.
-- **Frame ID encoding.** Should the seq number live in the cells (paid out of payload bytes) or in a dedicated visible region (faster to decode, costs grid area)?
 - **PWA install flow on two devices.** Pairing UX is real for unicast — we need a way for the two devices to know they're each other's counterpart. For broadcast it's simpler: receivers just point and look. A QR code with the session ID, displayed once at the start, is the easy unicast answer.
-- **Multiple senders, one receiver?** Probably out of scope, but interesting. The session ID guard already prevents crosstalk.
+- **Multiple senders, one receiver?** Probably out of scope, but interesting. The `session_id` guard already prevents crosstalk.
 
 ## 8. Milestones
 
@@ -262,9 +308,41 @@ A note on ordering: the forward-only unicast pipeline (M1–M8) is *almost* broa
 - **`hello_world.png`** (26,802 bytes, 3840×2160, 8-bit palette PNG) — the canonical end-to-end target. If it ever gets unwieldy for early milestones, we can downscale to e.g. 480×270 (smaller PNG bytes) without losing the "transmits a real PNG" property.
 - Synthetic random buffers (8 B, 800 B, 8 KB, 80 KB) — for unit tests, to keep the inner-loop fast.
 
+## 9.1 Rendering & colour conventions
+
+- **sRGB throughout.** The screen renders in sRGB; the camera reports sRGB-ish (post-ISP). We classify cells in sRGB space initially. If lighting issues bite, we'll switch to LAB or HSV — but only after measuring.
+- **No anti-aliasing on cell edges.** Cells are rendered as exact rectangular fills on integer pixel boundaries; antialiased edges would smear classification at the cell boundaries the camera sees.
+- **No subpixel positioning.** Frame top-left snaps to integer pixels; cell pitch is an integer number of pixels.
+- **Cell sampling on receive.** After perspective unwarp the receiver samples a small NxN patch in the *centre* of each cell (e.g., the central 50% of the cell area) and averages, to avoid edge contamination.
+- **Palette colours** are picked to be maximally separated in the camera's likely operating space. Black + primary RGB is the cheap-and-cheerful 4-colour starting point; larger palettes will need empirical placement.
+
 ## 10. Out of scope (forever or until requested)
 
 - Native mobile apps. Browser-only.
 - Audio side-channels. Photons only.
 - Network-assisted fallback. The whole point is *not* using the network.
 - Encryption / authentication of the optical link. Application layer's problem.
+
+## 11. Development workflow
+
+- **Tooling:** `mise` pins node + pnpm. `mise install` to set up.
+- **Commands:**
+  - `pnpm dev` — Vite dev server, both sender and receiver pages.
+  - `pnpm test` — Vitest, watch mode by default.
+  - `pnpm test --run` — single test run.
+  - `pnpm typecheck` — `tsc --noEmit`.
+  - `pnpm build` — typecheck + production bundle.
+- **Branches:** one feature branch per milestone, `feature/m<N>-<slug>`. Stack PRs with each milestone's base set to the previous milestone's branch; bottom of the stack targets `main`.
+- **PR template:** include the milestone's done-when criterion verbatim and link to the test that proves it.
+- **CI:** GitHub Actions runs typecheck + tests on every PR.
+
+## 12. Decision log
+
+Short list of "we chose X over Y because Z" calls, so future-us can find the reasoning quickly.
+
+- **Vitest over Jest.** Native ESM, native TS, shares Vite's transformer — zero-config and consistent with the runtime.
+- **mise over nvm/Volta.** Standardized on it at the team level (CLAUDE.md), polyglot, project-pinned tool versions.
+- **Bootstrap embedded in every frame, not periodic.** Zero join latency for broadcast — the property that matters most for the headline use case.
+- **PRNG-seeded fountain header, not explicit index lists.** Constant header size regardless of K; saves ~`⌈log2(K)⌉ × d` bits per encoded packet at large K.
+- **Hand-rolled homography for M3 instead of pulling a linear-algebra dep.** Small kernel, explicitly a learning project. Will reconsider if it shows up in profiles.
+- **Stacked PR workflow.** One milestone per PR by default, base-branch chained, opened as drafts. Lets each milestone be reviewed in isolation without blocking forward progress.
