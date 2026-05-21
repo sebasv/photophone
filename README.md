@@ -28,7 +28,7 @@ This project is, in that lineage, a (slightly absurd) postmodern fibre optic: th
 
 ## Status
 
-🚧 Very early — this repo currently scaffolds the project and outlines the architecture. Nothing actually transmits yet. The roadmap below is the plan.
+🚧 Very early — this repo currently scaffolds the project and outlines the architecture. Nothing actually transmits yet. The roadmap below is the plan; the full design lives in [`docs/DESIGN.md`](./docs/DESIGN.md).
 
 ## Stack
 
