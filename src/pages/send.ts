@@ -1,5 +1,5 @@
 import "../style.css";
-import { DEFAULT_GEOMETRY, PALETTE_2BIT, payloadCapacity } from "../protocol";
+import { DEFAULT_GEOMETRY, PALETTE_2BIT, payloadCellCount } from "../protocol";
 
 const fileInput = document.querySelector<HTMLInputElement>("#payload-input")!;
 const startButton = document.querySelector<HTMLButtonElement>("#start-button")!;
@@ -20,7 +20,7 @@ startButton.addEventListener("click", () => {
   if (!payload) return;
   drawPlaceholder(
     `Would transmit ${payload.length} bytes. Frame capacity: ` +
-      `${payloadCapacity(DEFAULT_GEOMETRY)} cells @ palette of ` +
+      `${payloadCellCount(DEFAULT_GEOMETRY)} payload cells @ palette of ` +
       `${PALETTE_2BIT.colors.length}.`,
   );
 });
