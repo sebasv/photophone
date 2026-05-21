@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0a0a0a" />
+    <title>Photophone · Send</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <main class="page page--send">
+      <header class="page__header">
+        <a href="/" class="back">← back</a>
+        <h1>Send</h1>
+      </header>
+      <section class="controls">
+        <label class="file-picker">
+          <input type="file" id="payload-input" accept="image/png" />
+          <span>Choose a PNG to transmit</span>
+        </label>
+        <button id="start-button" disabled>Start transmitting</button>
+      </section>
+      <section class="stage">
+        <canvas id="frame-canvas" width="800" height="800"></canvas>
+      </section>
+    </main>
+    <script type="module" src="/src/pages/send.ts"></script>
+  </body>
+</html>

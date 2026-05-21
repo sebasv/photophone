@@ -1,0 +1,171 @@
+:root {
+  color-scheme: dark;
+  --bg: #0a0a0a;
+  --fg: #f5f5f5;
+  --muted: #888;
+  --accent: #f9c846;
+  --line: #1f1f1f;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+.landing {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 4rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
+}
+
+.landing h1 {
+  font-size: clamp(2.5rem, 8vw, 4rem);
+  margin: 0;
+  letter-spacing: -0.02em;
+}
+
+.tagline {
+  color: var(--muted);
+  font-size: 1.1rem;
+  margin: 0;
+}
+
+.roles {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+@media (max-width: 540px) {
+  .roles {
+    grid-template-columns: 1fr;
+  }
+}
+
+.role {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #111;
+  transition: border-color 120ms ease, transform 120ms ease;
+}
+.role:hover {
+  border-color: var(--accent);
+  text-decoration: none;
+  transform: translateY(-2px);
+}
+
+.role__title {
+  font-size: 1.4rem;
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.role__hint {
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+footer {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.page {
+  max-width: 1024px;
+  margin: 0 auto;
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.page__header {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+}
+
+.page__header h1 {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.back {
+  color: var(--muted);
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+button,
+.file-picker {
+  background: #111;
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.6rem 1rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.file-picker input {
+  display: none;
+}
+
+.status {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.stage {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  background: #000;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 320px;
+}
+
+#frame-canvas,
+#camera-video {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 75vh;
+}

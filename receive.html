@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0a0a0a" />
+    <title>Photophone · Receive</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <main class="page page--receive">
+      <header class="page__header">
+        <a href="/" class="back">← back</a>
+        <h1>Receive</h1>
+      </header>
+      <section class="controls">
+        <button id="start-camera">Start camera</button>
+        <span id="status" class="status">idle</span>
+      </section>
+      <section class="stage">
+        <video id="camera-video" playsinline autoplay muted></video>
+      </section>
+    </main>
+    <script type="module" src="/src/pages/receive.ts"></script>
+  </body>
+</html>
