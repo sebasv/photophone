@@ -5,11 +5,20 @@ import {
   PALETTE_2BIT,
 } from "./codec";
 import {
+  applyHomography,
   cellRole,
+  computeHomography,
   DEFAULT_GEOMETRY,
   decodeFrame,
+  decodeFrameWarped,
+  detectFiducials,
+  fiducialCanonicalCentroids,
+  type Homography,
+  isFiducialMarkerCell,
   payloadCellCount,
   payloadCellPositions,
+  type Point,
+  type RawImage,
   renderFrame,
 } from "./framing";
 
@@ -113,4 +122,169 @@ function randomBytes(n: number, seed: number): Uint8Array {
     out[i] = s & 0xff;
   }
   return out;
+}
+
+describe("fiducial marker geometry", () => {
+  it("marks the inner 2×2 of each 4-cell fiducial as marker cells", () => {
+    expect(isFiducialMarkerCell(DEFAULT_GEOMETRY, 0, 0)).toBe(false);
+    expect(isFiducialMarkerCell(DEFAULT_GEOMETRY, 1, 1)).toBe(true);
+    expect(isFiducialMarkerCell(DEFAULT_GEOMETRY, 2, 2)).toBe(true);
+    expect(isFiducialMarkerCell(DEFAULT_GEOMETRY, 3, 3)).toBe(false);
+
+    expect(isFiducialMarkerCell(DEFAULT_GEOMETRY, 61, 61)).toBe(true);
+    expect(isFiducialMarkerCell(DEFAULT_GEOMETRY, 62, 62)).toBe(true);
+    expect(isFiducialMarkerCell(DEFAULT_GEOMETRY, 63, 63)).toBe(false);
+
+    expect(isFiducialMarkerCell(DEFAULT_GEOMETRY, 10, 10)).toBe(false);
+  });
+});
+
+describe("fiducial detection on a pristine frame", () => {
+  it("locates the four fiducial centroids at their canonical positions", () => {
+    const cellSizePx = 8;
+    const cells = new Uint8Array(payloadCellCount(DEFAULT_GEOMETRY));
+    const img = renderFrame(DEFAULT_GEOMETRY, PALETTE_2BIT, cells, cellSizePx);
+
+    const detected = detectFiducials(img, cellSizePx * 2);
+    expect(detected).not.toBeNull();
+    const canonical = fiducialCanonicalCentroids(DEFAULT_GEOMETRY, cellSizePx);
+
+    for (let i = 0; i < 4; i++) {
+      expect(detected![i]!.x).toBeCloseTo(canonical[i]!.x, 0);
+      expect(detected![i]!.y).toBeCloseTo(canonical[i]!.y, 0);
+    }
+  });
+});
+
+describe("homography solver", () => {
+  it("recovers the identity transform from coincident points", () => {
+    const pts: [Point, Point, Point, Point] = [
+      { x: 0, y: 0 },
+      { x: 100, y: 0 },
+      { x: 100, y: 100 },
+      { x: 0, y: 100 },
+    ];
+    const h = computeHomography(pts, pts);
+    for (const p of pts) {
+      const q = applyHomography(h, p);
+      expect(q.x).toBeCloseTo(p.x, 6);
+      expect(q.y).toBeCloseTo(p.y, 6);
+    }
+  });
+
+  it("maps corner points exactly to their destinations", () => {
+    const src: [Point, Point, Point, Point] = [
+      { x: 0, y: 0 },
+      { x: 100, y: 0 },
+      { x: 100, y: 100 },
+      { x: 0, y: 100 },
+    ];
+    const dst: [Point, Point, Point, Point] = [
+      { x: 50, y: 30 },
+      { x: 230, y: 70 },
+      { x: 260, y: 200 },
+      { x: 40, y: 180 },
+    ];
+    const h = computeHomography(src, dst);
+    for (let i = 0; i < 4; i++) {
+      const q = applyHomography(h, src[i]!);
+      expect(q.x).toBeCloseTo(dst[i]!.x, 6);
+      expect(q.y).toBeCloseTo(dst[i]!.y, 6);
+    }
+  });
+});
+
+describe("M3 done-when: decode a rotated, scaled, perspective-warped frame", () => {
+  const cellSizePx = 8;
+
+  it.each([
+    {
+      name: "small rotation + scale",
+      dst: [
+        { x: 120, y: 110 },
+        { x: 660, y: 80 },
+        { x: 690, y: 620 },
+        { x: 90, y: 590 },
+      ] as [Point, Point, Point, Point],
+    },
+    {
+      name: "stronger perspective",
+      dst: [
+        { x: 150, y: 200 },
+        { x: 620, y: 60 },
+        { x: 690, y: 660 },
+        { x: 70, y: 540 },
+      ] as [Point, Point, Point, Point],
+    },
+  ])("$name", ({ dst }) => {
+    // Render a pristine frame with a deterministic payload.
+    const original = randomBytes(800, 0xfeed);
+    const cells = bytesToCells(original, PALETTE_2BIT);
+    const capacity = payloadCellCount(DEFAULT_GEOMETRY);
+    const padded = new Uint8Array(capacity);
+    padded.set(cells);
+    const pristine = renderFrame(
+      DEFAULT_GEOMETRY,
+      PALETTE_2BIT,
+      padded,
+      cellSizePx,
+    );
+
+    // Warp it into a larger output buffer.
+    const src = fiducialCanonicalCentroids(DEFAULT_GEOMETRY, cellSizePx);
+    const inverse = computeHomography(dst, src);
+    const warped = warpImage(pristine, inverse, 800, 720);
+
+    // Detect + unwarp + decode.
+    const decoded = decodeFrameWarped(
+      DEFAULT_GEOMETRY,
+      PALETTE_2BIT,
+      warped,
+      cellSizePx,
+    );
+    const trimmed = decoded.slice(0, cells.length);
+    const restored = cellsToBytes(trimmed, PALETTE_2BIT);
+
+    expect(restored).toEqual(original);
+  });
+});
+
+/**
+ * Inverse-mapped bilinear warp: for every output pixel, sample the input
+ * through `inverseHomography` (warped-space → source-space). Used only by
+ * tests to generate synthetic perspective-warped frames.
+ */
+function warpImage(
+  src: RawImage,
+  inverseH: Homography,
+  outW: number,
+  outH: number,
+): RawImage {
+  const data = new Uint8ClampedArray(outW * outH * 4);
+  for (let y = 0; y < outH; y++) {
+    for (let x = 0; x < outW; x++) {
+      const p = applyHomography(inverseH, { x, y });
+      const sx = p.x;
+      const sy = p.y;
+      const oOut = (y * outW + x) * 4;
+      data[oOut + 3] = 255;
+      if (sx < 0 || sy < 0 || sx >= src.width - 1 || sy >= src.height - 1) {
+        continue;
+      }
+      const x0 = Math.floor(sx);
+      const y0 = Math.floor(sy);
+      const fx = sx - x0;
+      const fy = sy - y0;
+      const o00 = (y0 * src.width + x0) * 4;
+      const o10 = o00 + 4;
+      const o01 = o00 + src.width * 4;
+      const o11 = o01 + 4;
+      for (let c = 0; c < 3; c++) {
+        const a = src.data[o00 + c]! * (1 - fx) + src.data[o10 + c]! * fx;
+        const b = src.data[o01 + c]! * (1 - fx) + src.data[o11 + c]! * fx;
+        data[oOut + c] = Math.round(a * (1 - fy) + b * fy);
+      }
+    }
+  }
+  return { data, width: outW, height: outH };
 }
