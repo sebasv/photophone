@@ -241,6 +241,13 @@ A note on ordering: the forward-only unicast pipeline (M1–M8) is *almost* broa
 - Decode the config indicator first (worst-case parameters), then the rest of the frame.
 - **Done when:** the receiver decodes a frame that's been programmatically rotated, scaled, and perspective-warped (still synthetic, no camera) without errors.
 
+### M3.5 — Orientation-invariant fiducials
+- Make the top-left fiducial's inner marker an **L-shape** (3 cells out of the 2×2 inner area), keeping the other three fiducials' inner markers as solid 2×2 squares. This breaks the rotational symmetry of the four corner markers.
+- In `detectFiducials`, compute each cluster's **fill ratio** (`pixelCount / bboxArea`). The cluster with the lowest fill ratio (~0.75 vs ~1.0) is the top-left. Order the remaining three by clockwise angle around the centroid of all four to recover TR / BR / BL.
+- Fill ratio is a ratio of areas — projectively invariant — so the classification holds regardless of camera rotation, scale, or perspective.
+- A nice side effect: a human glancing at the rendered frame can tell at a glance which corner is "top-left", confirming the sender's intended orientation without a second device.
+- **Done when:** the same payload decodes correctly with the camera held at any of the four cardinal orientations (0°, 90° CW, 180°, 90° CCW). Verified with both synthetic-warp tests (rotated inputs to `decodeFrameWarped`) and the M4 manual capture loop.
+
 ### M4 — First camera capture
 - Receiver page: snap a still frame from `getUserMedia`, decode it.
 - **Done when:** a user can point their laptop camera at a phone displaying a Photophone frame, hit "capture", and see the decoded bytes. Holds still, one frame at a time.
