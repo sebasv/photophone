@@ -21,7 +21,7 @@ const SESSION: SessionInfo = { sessionId: 0xdeadbeef };
 describe("encodePacket / decodePacket", () => {
   it("round-trips a packet", () => {
     const payload = new Uint8Array([1, 2, 3, 4, 5]);
-    const wire = encodePacket(7, 42, payload, SESSION);
+    const wire = encodePacket(0, payload, SESSION);
 
     expect(wire.length).toBe(HEADER_SIZE + payload.length);
     expect(wire.slice(0, 4)).toEqual(MAGIC);
@@ -29,40 +29,45 @@ describe("encodePacket / decodePacket", () => {
 
     const parsed = decodePacket(wire, SESSION);
     expect(parsed).not.toBeNull();
-    expect(parsed!.seq).toBe(7);
-    expect(parsed!.total).toBe(42);
+    expect(parsed!.payloadOffset).toBe(0);
     expect(parsed!.payload).toEqual(payload);
   });
 
+  it("carries the byte offset round-trip", () => {
+    const payload = new Uint8Array([9, 9, 9]);
+    const wire = encodePacket(12345, payload, SESSION);
+    const parsed = decodePacket(wire, SESSION)!;
+    expect(parsed.payloadOffset).toBe(12345);
+    expect(parsed.payload).toEqual(payload);
+  });
+
   it("rejects wrong magic", () => {
-    const wire = encodePacket(0, 1, new Uint8Array(0), SESSION);
+    const wire = encodePacket(0, new Uint8Array(0), SESSION);
     wire[0] = 0;
     expect(decodePacket(wire, SESSION)).toBeNull();
   });
 
   it("rejects a different session", () => {
-    const wire = encodePacket(0, 1, new Uint8Array(0), SESSION);
+    const wire = encodePacket(0, new Uint8Array(0), SESSION);
     expect(decodePacket(wire, { sessionId: 0xcafef00d })).toBeNull();
   });
 
   it("rejects truncated payload", () => {
-    const wire = encodePacket(0, 1, new Uint8Array([1, 2, 3]), SESSION);
+    const wire = encodePacket(0, new Uint8Array([1, 2, 3]), SESSION);
     expect(decodePacket(wire.slice(0, wire.length - 1), SESSION)).toBeNull();
   });
 });
 
 describe("packetize", () => {
-  it("emits ceil(payload/size) packets and tags total consistently", () => {
+  it("emits packets with monotonically increasing offsets", () => {
     const payload = new Uint8Array(2500);
     const packets = packetize(payload, 1000, SESSION);
     expect(packets.length).toBe(3);
 
-    for (const wire of packets) {
-      const parsed = decodePacket(wire, SESSION)!;
-      expect(parsed.total).toBe(3);
-    }
+    const offsets = packets.map((p) => decodePacket(p, SESSION)!.payloadOffset);
+    expect(offsets).toEqual([0, 1000, 2000]);
 
-    // The last packet's payload is the residual (500 bytes).
+    // Last packet's payload is the residual.
     const last = decodePacket(packets[2]!, SESSION)!;
     expect(last.payload.length).toBe(500);
   });
@@ -73,72 +78,127 @@ describe("packetize", () => {
 });
 
 describe("reassembly state machine", () => {
-  it("accepts packets in any order and reports missing seq numbers", () => {
+  it("accepts packets in any order and reports missing byte ranges", () => {
     const original = new Uint8Array(2500);
     for (let i = 0; i < original.length; i++) original[i] = i & 0xff;
 
     const packets = packetize(original, 1000, SESSION);
-    const state = newReassembly(SESSION);
+    const state = newReassembly(SESSION, original.length);
 
-    expect(missing(state)).toEqual([]); // unknown until first packet seen
+    expect(missing(state)).toEqual([{ offset: 0, length: 2500 }]);
 
-    // out of order, with one dropped
     expect(ingest(state, packets[2]!)).toBe("accepted");
-    expect(state.expectedTotal).toBe(3);
-    expect(missing(state)).toEqual([0, 1]);
+    expect(missing(state)).toEqual([{ offset: 0, length: 2000 }]);
 
     expect(ingest(state, packets[0]!)).toBe("accepted");
-    expect(missing(state)).toEqual([1]);
+    expect(missing(state)).toEqual([{ offset: 1000, length: 1000 }]);
     expect(isComplete(state)).toBe(false);
 
-    // duplicate of one we already have
     expect(ingest(state, packets[0]!)).toBe("duplicate");
 
-    // finally fill the gap
     expect(ingest(state, packets[1]!)).toBe("accepted");
     expect(isComplete(state)).toBe(true);
     expect(missing(state)).toEqual([]);
-
     expect(reassemble(state)).toEqual(original);
   });
 
-  it("rejects packets from foreign sessions", () => {
-    const stranger = encodePacket(0, 1, new Uint8Array([1, 2, 3]), {
-      sessionId: 0x1234,
-    });
-    const state = newReassembly(SESSION);
-    expect(ingest(state, stranger)).toBe("rejected-session");
-    expect(state.expectedTotal).toBeNull();
+  it("merges adjacent and overlapping ranges into a single interval", () => {
+    const state = newReassembly(SESSION, 1000);
+
+    ingest(state, encodePacket(0, new Uint8Array(200), SESSION));
+    ingest(state, encodePacket(400, new Uint8Array(200), SESSION));
+    expect(state.received).toEqual([
+      { offset: 0, length: 200 },
+      { offset: 400, length: 200 },
+    ]);
+
+    // Fill the gap; everything should coalesce into one range.
+    ingest(state, encodePacket(200, new Uint8Array(200), SESSION));
+    expect(state.received).toEqual([{ offset: 0, length: 600 }]);
+
+    // Adjacent extension (no gap).
+    ingest(state, encodePacket(600, new Uint8Array(100), SESSION));
+    expect(state.received).toEqual([{ offset: 0, length: 700 }]);
+
+    // Overlapping extension absorbs an existing tail piece.
+    ingest(state, encodePacket(800, new Uint8Array(150), SESSION));
+    ingest(state, encodePacket(650, new Uint8Array(300), SESSION));
+    expect(state.received).toEqual([{ offset: 0, length: 950 }]);
   });
 
-  it("rejects mismatched totals after one was established", () => {
-    const a = encodePacket(0, 3, new Uint8Array([1]), SESSION);
-    const b = encodePacket(1, 4, new Uint8Array([2]), SESSION);
-    const state = newReassembly(SESSION);
-    expect(ingest(state, a)).toBe("accepted");
-    expect(ingest(state, b)).toBe("rejected-inconsistent-total");
+  it("rejects packets that would overrun the payload buffer", () => {
+    const state = newReassembly(SESSION, 100);
+    const wire = encodePacket(80, new Uint8Array(40), SESSION);
+    expect(ingest(state, wire)).toBe("out-of-bounds");
+  });
+
+  it("rejects packets from foreign sessions", () => {
+    const stranger = encodePacket(0, new Uint8Array([1, 2, 3]), {
+      sessionId: 0x1234,
+    });
+    const state = newReassembly(SESSION, 100);
+    expect(ingest(state, stranger)).toBe("rejected-session");
+    expect(state.received).toEqual([]);
   });
 
   it("throws on reassemble before complete, with the missing list in the error", () => {
     const packets = packetize(new Uint8Array(100), 30, SESSION);
-    const state = newReassembly(SESSION);
+    const state = newReassembly(SESSION, 100);
     ingest(state, packets[0]!);
     expect(() => reassemble(state)).toThrow(/missing/);
   });
 });
 
-describe("M2 done-when: hello_world.png round-trips through shuffle + drop + restore", () => {
+describe("variable-capacity retransmit", () => {
+  it("fills a missing range with multiple smaller packets at lower capacity", () => {
+    // Simulates the user's scenario: an original ~956-byte packet covered
+    // bytes [16252, 17208). Capacity drops to 400 bytes. We re-send the
+    // missing range as three smaller packets and reassembly closes the gap.
+    const totalSize = 30000;
+    const original = new Uint8Array(totalSize);
+    for (let i = 0; i < totalSize; i++) original[i] = (i * 7) & 0xff;
+
+    const state = newReassembly(SESSION, totalSize);
+
+    // First pass: deliver everything except the range [16252, 17208).
+    const firstPass = packetize(original, 956, SESSION);
+    for (const wire of firstPass) {
+      const p = decodePacket(wire, SESSION)!;
+      if (p.payloadOffset === 16252) continue;
+      ingest(state, wire);
+    }
+    const stillMissing = missing(state);
+    expect(stillMissing.length).toBe(1);
+    expect(stillMissing[0]!.offset).toBe(16252);
+    expect(stillMissing[0]!.length).toBe(956);
+
+    // Retransmit at lower capacity: 400-byte packets covering the missing
+    // range. The boundary doesn't align with the original packet boundary
+    // — that's the whole point.
+    const gap = stillMissing[0]!;
+    const retransmitSize = 400;
+    let off = gap.offset;
+    while (off < gap.offset + gap.length) {
+      const end = Math.min(off + retransmitSize, gap.offset + gap.length);
+      const slice = original.slice(off, end);
+      expect(ingest(state, encodePacket(off, slice, SESSION))).toBe("accepted");
+      off = end;
+    }
+
+    expect(isComplete(state)).toBe(true);
+    expect(reassemble(state)).toEqual(original);
+  });
+});
+
+describe("hello_world.png round-trips through shuffle + drop + restore", () => {
   it("reassembles byte-perfect when enough packets are present", () => {
     const png = readFileSync(new URL("../../hello_world.png", import.meta.url));
     const payload = new Uint8Array(png.buffer, png.byteOffset, png.byteLength);
     const sentSha = sha256(payload);
 
-    // Packet payload size of 633 matches the doc's predicted unicast capacity
-    // — see DESIGN.md §4.
     const packets = packetize(payload, 633, SESSION);
     expect(packets.length).toBeGreaterThan(40);
 
-    // Shuffle deterministically, drop a few, then add them back at the end.
     const shuffled = shuffle(packets, 0xabcd);
     const dropped: Uint8Array[] = [];
     const delivered: Uint8Array[] = [];
@@ -147,10 +207,10 @@ describe("M2 done-when: hello_world.png round-trips through shuffle + drop + res
       else delivered.push(shuffled[i]!);
     }
 
-    const state = newReassembly(SESSION);
+    const state = newReassembly(SESSION, payload.length);
     for (const w of delivered) ingest(state, w);
     expect(isComplete(state)).toBe(false);
-    expect(missing(state).length).toBe(dropped.length);
+    expect(missing(state).length).toBeGreaterThan(0);
 
     for (const w of dropped) ingest(state, w);
     expect(isComplete(state)).toBe(true);
@@ -160,20 +220,26 @@ describe("M2 done-when: hello_world.png round-trips through shuffle + drop + res
     expect(sha256(restored)).toBe(sentSha);
   });
 
-  it("cleanly reports missing seq numbers when packets are lost", () => {
+  it("reports the exact missing byte ranges when packets are lost", () => {
     const png = readFileSync(new URL("../../hello_world.png", import.meta.url));
     const payload = new Uint8Array(png.buffer, png.byteOffset, png.byteLength);
-    const packets = packetize(payload, 633, SESSION);
+    const packetSize = 633;
+    const packets = packetize(payload, packetSize, SESSION);
 
-    const state = newReassembly(SESSION);
-    const dropMe = new Set([3, 17, 41]);
+    const state = newReassembly(SESSION, payload.length);
+    const dropIdx = new Set([3, 17, 41]);
     for (let i = 0; i < packets.length; i++) {
-      if (dropMe.has(i)) continue;
+      if (dropIdx.has(i)) continue;
       ingest(state, packets[i]!);
     }
 
     expect(isComplete(state)).toBe(false);
-    expect(missing(state).sort((a, b) => a - b)).toEqual([3, 17, 41]);
+    const gaps = missing(state);
+    expect(gaps.length).toBe(3);
+    const expectedOffsets = [...dropIdx].sort((a, b) => a - b).map((i) => i * packetSize);
+    for (let i = 0; i < expectedOffsets.length; i++) {
+      expect(gaps[i]!.offset).toBe(expectedOffsets[i]!);
+    }
   });
 });
 
