@@ -1,4 +1,5 @@
-import { defineConfig } from "vite";
+
+import { defineConfig } from "vitest/config";
 import { VitePWA } from "vite-plugin-pwa";
 import { resolve } from "node:path";
 
@@ -27,5 +28,9 @@ export default defineConfig({
         receive: resolve(__dirname, "receive.html"),
       },
     },
+  },
+  test: {
+    environment: "node",
+    include: ["src/**/*.test.ts"],
   },
 });
