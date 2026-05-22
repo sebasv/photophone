@@ -336,6 +336,26 @@ A note on ordering: the forward-only unicast pipeline (M1–M8) is *almost* broa
 - **PR template:** include the milestone's done-when criterion verbatim and link to the test that proves it.
 - **CI:** GitHub Actions runs typecheck + tests on every PR.
 
+## 11.1 Diagnostics & dev overlays
+
+Photophone's failure modes are largely visual — fiducials missed, cells misclassified, sampling points drifting off-cell — and a hex dump of decoded bytes rarely tells you _why_. Diagnostic overlays give the developer a visual layer on top of the production UI that exposes what the protocol layer "saw" during a capture or stream.
+
+**Conventions:**
+
+- **Toggle-gated.** A single "Show diagnostics" checkbox per page, off by default, state persisted in `localStorage` so it survives reloads. Off → clean demo UI; on → developer view.
+- **Off the hot path.** Diagnostics never run when the toggle is off; their cost stays at zero for the "show this to someone" demo case.
+- **Parallel APIs in the protocol layer.** When a diagnostic surface needs internals (e.g. all detected marker candidates, not just the four chosen ones), add a `*WithDiagnostics` variant that returns the richer data. Keep the lean production function unchanged.
+
+**Planned surfaces:**
+
+| Surface | Lands with | What it shows |
+| --- | --- | --- |
+| **Receiver capture overlay** | M4.5 (stacked on M4) | Detected fiducial centroids (TL/TR/BR/BL colour-coded), cluster bounding boxes, rejected candidates in muted colours, the reconstructed grid overlaid on the warped image. Diagnoses "where did detection go wrong". |
+| **Colour-score panel** | M4.5 (same PR) | For each marker candidate: pixel count, mean RGB, min RGB, role (chosen / rejected-too-small / rejected-too-large / not-a-corner). Drives empirical tuning of the >200 marker threshold. |
+| **Bytestream progress visualizer** | M6 companion | A sparse-fill bar showing the payload buffer with received byte ranges filled and gaps unfilled. Lets the developer see which parts of a multi-frame transmission have landed and which are still pending. |
+
+When in doubt: prefer adding to diagnostics rather than to the demo UI. The demo path should stay legible to a non-developer; the diagnostic path is for us.
+
 ## 12. Decision log
 
 Short list of "we chose X over Y because Z" calls, so future-us can find the reasoning quickly.
