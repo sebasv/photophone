@@ -221,3 +221,28 @@ button:disabled {
 .page--send .file-picker {
   color: var(--accent);
 }
+
+.diagnostics-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.diagnostics-toggle input {
+  accent-color: var(--accent);
+}
+
+.diagnostics-panel {
+  border-color: #2a2a2a;
+  background: #0a0a0a;
+  margin-top: -0.5rem;
+}
+
+.diagnostics-panel pre {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
