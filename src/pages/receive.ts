@@ -69,24 +69,14 @@ captureButton.addEventListener("click", () => {
 
   const rawImage = { data: imageData.data, width: w, height: h };
 
-  // Pixel-area bounds for fiducial markers. The expected size depends on
-  // how the sender's canvas is framed in the camera view — for a typical
-  // phone-camera-at-laptop or laptop-camera-at-phone setup, marker clusters
-  // land between 50 and 20000 pixels. M5+ will tighten this.
-  const detectionBounds = {
-    minClusterPixels: 50,
-    maxClusterPixels: 20000,
-  };
-
   try {
-    const cells = decodeFrameWarped(
+    const result = decodeFrameWarped(
       DEFAULT_GEOMETRY,
       PALETTE_2BIT,
       rawImage,
       8,
-      detectionBounds,
     );
-    const bytes = cellsToBytes(cells, PALETTE_2BIT);
+    const bytes = cellsToBytes(result.cells, PALETTE_2BIT);
     const packet = decodePacket(bytes, M4_SESSION);
 
     if (!packet) {
@@ -100,10 +90,20 @@ captureButton.addEventListener("click", () => {
     }
 
     const looksLikePng = isPngHeader(packet.payload);
+    const orientationLabel = ["upright", "90° CW", "180°", "90° CCW"][result.orientation] ?? `rotation ${result.orientation}`;
+    const firstEight = formatHexInline(packet.payload.slice(0, 8));
+    const pngLine = looksLikePng
+      ? `   ✓ PNG file signature (89 50 4E 47 0D 0A 1A 0A) matched — payload looks intact`
+      : `   ✗ Expected PNG file signature 89 50 4E 47 0D 0A 1A 0A; got ${firstEight} — some payload cells likely misclassified`;
+    // Two distinct integrity layers: the packet header's PHOT magic
+    // (verified by decodeFrameWarped's orientation logic and again by
+    // decodePacket) and the PNG file signature inside the payload.
     output.textContent =
-      `✓ Packet accepted\n` +
-      `Session 0x${packet.sessionId.toString(16)}, offset ${packet.payloadOffset}, payload ${packet.payload.length} bytes\n` +
-      (looksLikePng ? `✓ Payload starts with the PNG magic (89 50 4E 47 …)\n` : `(payload does not start with a known magic)\n`) +
+      `✓ Packet accepted (camera held ${orientationLabel})\n` +
+      `   • PHOT magic + version + session 0x${packet.sessionId.toString(16).padStart(8, "0")} all valid\n` +
+      `   • Payload offset ${packet.payloadOffset}, length ${packet.payload.length} bytes\n` +
+      `\nFile-content sanity check:\n` +
+      `${pngLine}\n` +
       `\nFirst 64 bytes of payload:\n${formatHex(packet.payload.slice(0, 64))}`;
     status.textContent = "captured";
   } catch (err) {
@@ -111,6 +111,10 @@ captureButton.addEventListener("click", () => {
     status.textContent = "capture failed";
   }
 });
+
+function formatHexInline(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join(" ");
+}
 
 function formatHex(bytes: Uint8Array): string {
   const lines: string[] = [];

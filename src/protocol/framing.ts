@@ -1,27 +1,40 @@
 /**
- * Framing: the visual layout rendered to the screen and the geometric
- * machinery for finding it again in a (possibly warped) image.
+ * Framing — frame layout, rendering, and the M3.5 robust detection pipeline.
  *
  * Cell roles:
- *   - fiducial markers in each corner — outer ring uses palette colour 0
- *     (black); inner 2×2 uses a *non-palette* marker colour (pure white)
- *     so the receiver can locate fiducials with a single colour test, even
- *     when payload cells share the palette
+ *   - fiducial — corner Position Detection Patterns (PDPs), 7×7 cells each,
+ *     rendered as three concentric rings: black outer / white middle / black
+ *     inner 3×3 (1:1:3:1:1 cross-section ratio, identical to QR codes' finder
+ *     patterns)
  *   - config indicator (decoded with worst-case parameters; placeholder for now)
  *   - calibration strip (palette samples for per-frame classifier training)
  *   - payload grid
  *
- * Pristine decode (`decodeFrame`) is for axis-aligned images.
- * Warped decode (`decodeFrameWarped`) detects fiducial centroids, solves the
- * canonical→image homography, and samples each cell at the warped position
- * of its canonical centre.
+ * Detection (M3.5):
+ *   1. Otsu's method picks a per-frame brightness threshold from the
+ *      luminance histogram, replacing the old fixed >200 constant. Survives
+ *      indoor/outdoor lighting changes transparently.
+ *   2. Connected components of "above threshold" and "below threshold" pixels
+ *      are computed. A real PDP shows up as a dark inner cluster fully
+ *      enclosed by a white ring, with the two areas in roughly 9:16 ratio
+ *      (the canonical 3×3 black centre vs. 16-cell white ring).
+ *   3. We pick the 4 PDPs closest to the image corners and try all 4
+ *      rotational assignments to canonical TL/TR/BR/BL; the rotation whose
+ *      first 16 payload cells decode to the "PHOT" magic wins. False-positive
+ *      probability per non-matching rotation is 2⁻³².
  */
 
 import type { Palette } from "./codec";
+import { bitsPerCell, cellsToBytes } from "./codec";
+
+// =========================================================================
+// Geometry
+// =========================================================================
 
 export interface FrameGeometry {
   cellsX: number;
   cellsY: number;
+  /** PDP side length in cells. M3.5: 7 (QR-style 1:1:3:1:1). */
   fiducialSize: number;
   configRow: number;
   configColStart: number;
@@ -33,15 +46,15 @@ export interface FrameGeometry {
 export const DEFAULT_GEOMETRY: FrameGeometry = {
   cellsX: 64,
   cellsY: 64,
-  fiducialSize: 4,
+  fiducialSize: 7,
   configRow: 0,
-  configColStart: 4,
+  configColStart: 7,
   configWidth: 16,
-  calibrationRowStart: 4,
+  calibrationRowStart: 7,
   calibrationHeight: 2,
 };
 
-/** Non-palette marker colour for fiducial inner squares. */
+/** Non-palette marker colour for the PDPs' white middle ring. */
 export const FIDUCIAL_MARKER_RGB: readonly [number, number, number] = [
   255, 255, 255,
 ];
@@ -78,15 +91,18 @@ export function cellRole(
 }
 
 /**
- * Returns true if (x, y) is in the inner 2×2 of one of the four corner
- * fiducials — i.e., the cell should be painted with the marker colour.
+ * For a cell inside a corner PDP, return the colour role:
+ *  - "black" for the outer ring (distance 0 from PDP edge) and the inner 3×3 centre (distance >= 2)
+ *  - "white" for the middle ring (distance 1) — the only cells painted in the non-palette marker colour
+ *
+ * Caller must have already verified `cellRole(g, x, y) === "fiducial"`.
+ * Returns "black" for non-fiducial cells (defensive but not relied on).
  */
-export function isFiducialMarkerCell(
+export function pdpCellColour(
   g: FrameGeometry,
   x: number,
   y: number,
-): boolean {
-  if (cellRole(g, x, y) !== "fiducial") return false;
+): "black" | "white" {
   const fs = g.fiducialSize;
   let baseX = 0;
   let baseY = 0;
@@ -94,7 +110,9 @@ export function isFiducialMarkerCell(
   if (y >= g.cellsY - fs) baseY = g.cellsY - fs;
   const lx = x - baseX;
   const ly = y - baseY;
-  return lx >= 1 && lx <= fs - 2 && ly >= 1 && ly <= fs - 2;
+  if (lx < 0 || lx >= fs || ly < 0 || ly >= fs) return "black";
+  const distToEdge = Math.min(lx, ly, fs - 1 - lx, fs - 1 - ly);
+  return distToEdge === 1 ? "white" : "black";
 }
 
 export function payloadCellPositions(
@@ -128,13 +146,9 @@ export function frameHeightPx(g: FrameGeometry, cellSizePx: number): number {
 }
 
 /**
- * Canonical (un-warped) image-space centroid of each fiducial inner-marker
- * cluster, ordered top-left, top-right, bottom-right, bottom-left.
- *
- * The inner 2×2 marker spans pixels [cs, (fs-1)·cs) in each axis on the
- * top-left fiducial, so its discrete pixel centroid is at
- * (cs + (fs-1)·cs − 1)/2 = (fs·cs − 1)/2 — half a pixel "before" the cell
- * boundary, because we're averaging integer pixel coordinates.
+ * Canonical (un-warped) image-space centroid of each PDP, ordered TL/TR/BR/BL.
+ * The PDP centroid is the centre of its 3×3 inner-black region, which for a
+ * fiducial occupying cells [0, fs) is at pixel ((fs·cellSizePx)/2 − 0.5).
  */
 export function fiducialCanonicalCentroids(
   g: FrameGeometry,
@@ -151,6 +165,10 @@ export function fiducialCanonicalCentroids(
     { x: c, y: bottom },
   ];
 }
+
+// =========================================================================
+// Rendering
+// =========================================================================
 
 function fillRect(
   img: RawImage,
@@ -202,9 +220,10 @@ export function renderFrame(
           rgb = palette.colors[payloadCells[payloadIdx++]!]!;
           break;
         case "fiducial":
-          rgb = isFiducialMarkerCell(g, cx, cy)
-            ? FIDUCIAL_MARKER_RGB
-            : palette.colors[0]!;
+          rgb =
+            pdpCellColour(g, cx, cy) === "white"
+              ? FIDUCIAL_MARKER_RGB
+              : palette.colors[0]!;
           break;
         case "config":
           rgb = palette.colors[0]!;
@@ -221,7 +240,7 @@ export function renderFrame(
 
 /**
  * Decode a pristine, axis-aligned frame. No fiducial detection. Used by M1
- * tests and as a fallback when no warp is expected.
+ * unit tests where the canvas and the decoder share the exact same geometry.
  */
 export function decodeFrame(
   g: FrameGeometry,
@@ -249,144 +268,39 @@ export function decodeFrame(
   return out;
 }
 
-// -----------------------------------------------------------------------
-// M3: fiducial detection, homography, warped decode
-// -----------------------------------------------------------------------
+function sampleNearestPalette(
+  img: RawImage,
+  palette: Palette,
+  x: number,
+  y: number,
+): number {
+  const o = (y * img.width + x) * 4;
+  const r = img.data[o]!;
+  const g = img.data[o + 1]!;
+  const b = img.data[o + 2]!;
+  let bestIdx = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < palette.colors.length; i++) {
+    const [pr, pg, pb] = palette.colors[i]!;
+    const dr = r - pr;
+    const dg = g - pg;
+    const db = b - pb;
+    const d = dr * dr + dg * dg + db * db;
+    if (d < bestDist) {
+      bestDist = d;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
+// =========================================================================
+// Homography (4-point projective solve)
+// =========================================================================
 
 export interface Point {
   x: number;
   y: number;
-}
-
-export interface FiducialDetectionBounds {
-  /** Minimum pixel count for a marker cluster. */
-  minClusterPixels: number;
-  /** Maximum pixel count for a marker cluster. */
-  maxClusterPixels: number;
-}
-
-/**
- * Convenience: derive detection bounds from a known canonical cell size.
- * Used by tests where the image dimensions are controlled. Real receivers
- * processing a camera frame should pass image-size-derived bounds because
- * the apparent fiducial size depends on how the sender is framed.
- */
-export function detectionBoundsForCellSize(
-  cellSizePx: number,
-): FiducialDetectionBounds {
-  const expected = cellSizePx * cellSizePx * 4; // inner 2×2 marker = 4 cells
-  return {
-    minClusterPixels: expected / 8,
-    maxClusterPixels: expected * 9,
-  };
-}
-
-/**
- * Find the four fiducial centroids in an image. Returns null if detection
- * fails (e.g., < 4 candidate clusters survive filtering).
- *
- * Looks for connected components of the non-palette marker colour (white).
- * Because the marker colour is not in the palette, payload cells can never
- * be confused with fiducials.
- */
-export function detectFiducials(
-  img: RawImage,
-  bounds: FiducialDetectionBounds,
-): [Point, Point, Point, Point] | null {
-  const components = findMarkerComponents(img);
-  const filtered = components.filter(
-    (c) =>
-      c.pixelCount >= bounds.minClusterPixels &&
-      c.pixelCount <= bounds.maxClusterPixels,
-  );
-  if (filtered.length < 4) return null;
-
-  // For each image corner, take the candidate closest to it (in Manhattan
-  // distance). Robust to spurious mid-image white blobs that survive size
-  // filtering — what matters is which corner each fiducial owns.
-  const w = img.width;
-  const h = img.height;
-  const corners: Point[] = [
-    { x: 0, y: 0 },
-    { x: w, y: 0 },
-    { x: w, y: h },
-    { x: 0, y: h },
-  ];
-  const picks: Point[] = [];
-  const used = new Set<number>();
-  for (const corner of corners) {
-    let bestIdx = -1;
-    let bestDist = Infinity;
-    for (let i = 0; i < filtered.length; i++) {
-      if (used.has(i)) continue;
-      const c = filtered[i]!.centroid;
-      const d = Math.abs(c.x - corner.x) + Math.abs(c.y - corner.y);
-      if (d < bestDist) {
-        bestDist = d;
-        bestIdx = i;
-      }
-    }
-    if (bestIdx === -1) return null;
-    used.add(bestIdx);
-    picks.push(filtered[bestIdx]!.centroid);
-  }
-  return [picks[0]!, picks[1]!, picks[2]!, picks[3]!];
-}
-
-interface Component {
-  centroid: Point;
-  pixelCount: number;
-}
-
-function isMarkerPixel(img: RawImage, x: number, y: number): boolean {
-  const o = (y * img.width + x) * 4;
-  // Loose threshold so bilinear-interpolated edge pixels after warping still
-  // register as marker.
-  return img.data[o]! > 200 && img.data[o + 1]! > 200 && img.data[o + 2]! > 200;
-}
-
-function findMarkerComponents(img: RawImage): Component[] {
-  const w = img.width;
-  const h = img.height;
-  const visited = new Uint8Array(w * h);
-  const components: Component[] = [];
-  // Stack-based flood fill using a Uint32Array buffer to avoid per-pixel
-  // array allocation cost.
-  const stack = new Uint32Array(w * h);
-
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const seed = y * w + x;
-      if (visited[seed] || !isMarkerPixel(img, x, y)) continue;
-      let sp = 0;
-      stack[sp++] = seed;
-      let sumX = 0;
-      let sumY = 0;
-      let count = 0;
-      while (sp > 0) {
-        const idx = stack[--sp]!;
-        if (visited[idx]) continue;
-        visited[idx] = 1;
-        const px = idx % w;
-        const py = (idx / w) | 0;
-        if (!isMarkerPixel(img, px, py)) continue;
-        sumX += px;
-        sumY += py;
-        count++;
-        if (px + 1 < w) stack[sp++] = idx + 1;
-        if (px > 0) stack[sp++] = idx - 1;
-        if (py + 1 < h) stack[sp++] = idx + w;
-        if (py > 0) stack[sp++] = idx - w;
-      }
-      if (count > 0) {
-        components.push({
-          centroid: { x: sumX / count, y: sumY / count },
-          pixelCount: count,
-        });
-      }
-    }
-  }
-  return components;
 }
 
 export interface Homography {
@@ -394,18 +308,10 @@ export interface Homography {
   m: Float64Array;
 }
 
-/**
- * Solve the homography that maps the four source points to the four
- * destination points: dst ≅ H · src (with the third coordinate = 1).
- *
- * Standard 8-equation direct linear solve, setting h33 = 1.
- * 4 point pairs → 8 equations, 8 unknowns. We solve via Gaussian elimination.
- */
 export function computeHomography(
   src: readonly [Point, Point, Point, Point],
   dst: readonly [Point, Point, Point, Point],
 ): Homography {
-  // Build the 8×9 augmented matrix (8 unknowns + 1 rhs column).
   const a = new Float64Array(8 * 9);
   for (let i = 0; i < 4; i++) {
     const { x, y } = src[i]!;
@@ -415,16 +321,10 @@ export function computeHomography(
     a[r1 * 9 + 0] = x;
     a[r1 * 9 + 1] = y;
     a[r1 * 9 + 2] = 1;
-    a[r1 * 9 + 3] = 0;
-    a[r1 * 9 + 4] = 0;
-    a[r1 * 9 + 5] = 0;
     a[r1 * 9 + 6] = -X * x;
     a[r1 * 9 + 7] = -X * y;
     a[r1 * 9 + 8] = X;
 
-    a[r2 * 9 + 0] = 0;
-    a[r2 * 9 + 1] = 0;
-    a[r2 * 9 + 2] = 0;
     a[r2 * 9 + 3] = x;
     a[r2 * 9 + 4] = y;
     a[r2 * 9 + 5] = 1;
@@ -481,31 +381,380 @@ export function applyHomography(h: Homography, p: Point): Point {
   return { x, y };
 }
 
+// =========================================================================
+// M3.5: Otsu adaptive thresholding
+// =========================================================================
+
 /**
- * Decode a frame after detecting fiducials and applying the
- * canonical→image perspective transform.
+ * Otsu's method: pick the brightness threshold that maximises the
+ * between-class variance of dark vs. bright pixels in the image's luminance
+ * histogram. Returns a value in [0, 255], or -1 if the image is uniform.
  *
- * `cellSizePx` is the cell size in the *canonical* (un-warped) coordinate
- * space — the same value passed to renderFrame originally.
+ * Luminance is the standard Rec. 601 weighting `0.299R + 0.587G + 0.114B`
+ * (computed in integer arithmetic to avoid float overhead in the inner loop).
+ */
+export function otsuThreshold(img: RawImage): number {
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < img.data.length; i += 4) {
+    const r = img.data[i]!;
+    const g = img.data[i + 1]!;
+    const b = img.data[i + 2]!;
+    const y = (299 * r + 587 * g + 114 * b + 500) / 1000 | 0;
+    hist[y]!++;
+  }
+  const total = (img.data.length / 4) | 0;
+
+  let sumAll = 0;
+  for (let i = 0; i < 256; i++) sumAll += i * hist[i]!;
+
+  let sumB = 0;
+  let wB = 0;
+  let maxBetween = -1;
+  let bestT = -1;
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t]!;
+    if (wB === 0) continue;
+    const wF = total - wB;
+    if (wF <= 0) break;
+    sumB += t * hist[t]!;
+    const mB = sumB / wB;
+    const mF = (sumAll - sumB) / wF;
+    const between = wB * wF * (mB - mF) * (mB - mF);
+    if (between > maxBetween) {
+      maxBetween = between;
+      bestT = t;
+    }
+  }
+  return bestT;
+}
+
+// =========================================================================
+// M3.5: PDP detection
+// =========================================================================
+
+interface Component {
+  centroid: Point;
+  pixelCount: number;
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}
+
+/**
+ * Compute luminance of a single pixel using the same Rec. 601 weighting
+ * Otsu uses, so threshold comparisons are consistent.
+ */
+function luminance(img: RawImage, x: number, y: number): number {
+  const o = (y * img.width + x) * 4;
+  const r = img.data[o]!;
+  const g = img.data[o + 1]!;
+  const b = img.data[o + 2]!;
+  return ((299 * r + 587 * g + 114 * b + 500) / 1000) | 0;
+}
+
+/**
+ * Iterative 4-connected flood-fill of pixels matching `predicate(x, y)`.
+ * Re-used for finding both bright and dark connected components.
+ */
+function findComponents(
+  img: RawImage,
+  predicate: (x: number, y: number) => boolean,
+): Component[] {
+  const w = img.width;
+  const h = img.height;
+  const visited = new Uint8Array(w * h);
+  const stack = new Uint32Array(w * h);
+  const components: Component[] = [];
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const seed = y * w + x;
+      if (visited[seed] || !predicate(x, y)) continue;
+      let sp = 0;
+      stack[sp++] = seed;
+      let sumX = 0;
+      let sumY = 0;
+      let count = 0;
+      let minX = x;
+      let maxX = x;
+      let minY = y;
+      let maxY = y;
+      while (sp > 0) {
+        const idx = stack[--sp]!;
+        if (visited[idx]) continue;
+        visited[idx] = 1;
+        const px = idx % w;
+        const py = (idx / w) | 0;
+        if (!predicate(px, py)) continue;
+        sumX += px;
+        sumY += py;
+        count++;
+        if (px < minX) minX = px;
+        if (px > maxX) maxX = px;
+        if (py < minY) minY = py;
+        if (py > maxY) maxY = py;
+        if (px + 1 < w) stack[sp++] = idx + 1;
+        if (px > 0) stack[sp++] = idx - 1;
+        if (py + 1 < h) stack[sp++] = idx + w;
+        if (py > 0) stack[sp++] = idx - w;
+      }
+      if (count > 0) {
+        components.push({
+          centroid: { x: sumX / count, y: sumY / count },
+          pixelCount: count,
+          minX,
+          maxX,
+          minY,
+          maxY,
+        });
+      }
+    }
+  }
+  return components;
+}
+
+export interface PDPCandidate {
+  centroid: Point;
+  whiteRingArea: number;
+  blackCentreArea: number;
+  /** Ratio whiteRingArea / blackCentreArea — should be near 16/9 ≈ 1.78 for a clean PDP. */
+  areaRatio: number;
+}
+
+/**
+ * Find Position Detection Pattern candidates: pairs of a bright (above-Otsu)
+ * connected component (the white middle ring) and a dark (below-Otsu)
+ * connected component (the inner 3×3 black centre) whose bounding boxes nest
+ * correctly and whose area ratio is in the expected range.
+ *
+ * Canonical area ratio: 16 white cells / 9 black centre cells = 1.78. The
+ * tolerance is intentionally wide (0.6× to 4×) because partial pixels at
+ * boundaries and bilinear smearing under warp distort the discrete counts.
+ */
+export function detectPDPs(img: RawImage, threshold: number): PDPCandidate[] {
+  const whites = findComponents(img, (x, y) => luminance(img, x, y) > threshold);
+  const darks = findComponents(img, (x, y) => luminance(img, x, y) <= threshold);
+
+  const candidates: PDPCandidate[] = [];
+  for (const white of whites) {
+    if (white.pixelCount < 16) continue; // a single white pixel is not a PDP ring
+    if (white.pixelCount > img.width * img.height * 0.5) continue; // overwhelming background
+    for (const dark of darks) {
+      // Dark centre must lie entirely inside the white ring's bbox.
+      if (dark.minX < white.minX || dark.maxX > white.maxX) continue;
+      if (dark.minY < white.minY || dark.maxY > white.maxY) continue;
+      // Dark centroid must be near the white centroid (within half the bbox
+      // diagonal). Filters out the "page background" dark blob that touches
+      // the image edges through the corners.
+      const dx = dark.centroid.x - white.centroid.x;
+      const dy = dark.centroid.y - white.centroid.y;
+      const ringDiag =
+        ((white.maxX - white.minX) + (white.maxY - white.minY)) / 2;
+      if (Math.hypot(dx, dy) > ringDiag * 0.5) continue;
+      // Area ratio sanity check.
+      const ratio = white.pixelCount / dark.pixelCount;
+      if (ratio < 0.6 || ratio > 4.0) continue;
+      candidates.push({
+        centroid: dark.centroid,
+        whiteRingArea: white.pixelCount,
+        blackCentreArea: dark.pixelCount,
+        areaRatio: ratio,
+      });
+    }
+  }
+  return candidates;
+}
+
+/**
+ * Pick the four PDPs closest to the image corners (one per corner). Returns
+ * null if fewer than four candidates were supplied or some corner can't be
+ * uniquely claimed.
+ *
+ * The choice of "closest to image corner" is intentional: even with mid-image
+ * false-positive PDP-like patches, the four real fiducials genuinely sit
+ * nearest the four image corners.
+ *
+ * Returned order: by image corner (top-left, top-right, bottom-right,
+ * bottom-left) — *not* by sender-frame orientation. Orientation is recovered
+ * later by trying all four rotational assignments against the magic.
+ */
+function pickFourByImageCorner(
+  candidates: ReadonlyArray<{ centroid: Point }>,
+  imgW: number,
+  imgH: number,
+): [Point, Point, Point, Point] | null {
+  if (candidates.length < 4) return null;
+  const corners: Point[] = [
+    { x: 0, y: 0 },
+    { x: imgW, y: 0 },
+    { x: imgW, y: imgH },
+    { x: 0, y: imgH },
+  ];
+  const used = new Set<number>();
+  const picks: Point[] = [];
+  for (const corner of corners) {
+    let bestIdx = -1;
+    let bestDist = Infinity;
+    for (let i = 0; i < candidates.length; i++) {
+      if (used.has(i)) continue;
+      const c = candidates[i]!.centroid;
+      const d = Math.abs(c.x - corner.x) + Math.abs(c.y - corner.y);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx === -1) return null;
+    used.add(bestIdx);
+    picks.push(candidates[bestIdx]!.centroid);
+  }
+  return [picks[0]!, picks[1]!, picks[2]!, picks[3]!];
+}
+
+/**
+ * Detect the four PDP centroids in an image, arranged by image corner
+ * (image-TL, image-TR, image-BR, image-BL). Orientation relative to the
+ * sender's frame is not yet known — that comes from the magic-validation
+ * pass inside `decodeFrameWarped`.
+ *
+ * Returns null if fewer than four PDPs were detected.
+ */
+export function detectFiducials(
+  img: RawImage,
+): [Point, Point, Point, Point] | null {
+  const threshold = otsuThreshold(img);
+  if (threshold < 0) return null;
+  const pdps = detectPDPs(img, threshold);
+  return pickFourByImageCorner(pdps, img.width, img.height);
+}
+
+// =========================================================================
+// M3.5: warped decode with orientation recovery
+// =========================================================================
+
+/** PHOT — the 4-byte magic at the start of every packet. */
+const MAGIC: ReadonlyArray<number> = [0x50, 0x48, 0x4f, 0x54];
+
+/**
+ * Each rotation is a cyclic shift of the (TL, TR, BR, BL) image-corner
+ * assignment: rotation r places the image-corner blob at slot (TL+r) mod 4
+ * as the canonical TL. Together the four rotations cover the four cardinal
+ * camera orientations.
+ */
+function rotateAssignment(
+  imageCorners: readonly [Point, Point, Point, Point],
+  rotation: number,
+): [Point, Point, Point, Point] {
+  return [
+    imageCorners[(0 + rotation) % 4]!,
+    imageCorners[(1 + rotation) % 4]!,
+    imageCorners[(2 + rotation) % 4]!,
+    imageCorners[(3 + rotation) % 4]!,
+  ];
+}
+
+export interface WarpedDecodeResult {
+  /** Full payload-cell array (length = `payloadCellCount(g)`). */
+  cells: Uint8Array;
+  /** Rotation that produced the matching magic, 0..3. */
+  orientation: number;
+  /** Detected PDP centroids in image-corner order (pre-orientation). */
+  imageCornerCentroids: [Point, Point, Point, Point];
+}
+
+/**
+ * Decode a (possibly warped, possibly rotated) frame.
+ *
+ *  1. Detect four PDPs via Otsu + connected-components (`detectFiducials`)
+ *  2. For each of four rotational assignments, solve the canonical→image
+ *     homography, sample the first 16 payload cells (= 4 bytes), and check
+ *     whether those bytes equal the "PHOT" magic
+ *  3. The rotation whose magic matches is the correct orientation; decode
+ *     the full payload at that rotation
  */
 export function decodeFrameWarped(
   g: FrameGeometry,
   palette: Palette,
   img: RawImage,
   cellSizePx: number,
-  detection?: FiducialDetectionBounds,
-): Uint8Array {
-  const bounds = detection ?? detectionBoundsForCellSize(cellSizePx);
-  const fiducials = detectFiducials(img, bounds);
-  if (!fiducials) {
-    throw new Error("decodeFrameWarped: fiducial detection failed");
+): WarpedDecodeResult {
+  const imageCorners = detectFiducials(img);
+  if (!imageCorners) {
+    throw new Error("decodeFrameWarped: PDP detection failed");
   }
-  const canonical = fiducialCanonicalCentroids(g, cellSizePx);
-  const h = computeHomography(canonical, fiducials);
 
+  const canonical = fiducialCanonicalCentroids(g, cellSizePx);
   const positions = payloadCellPositions(g);
-  const out = new Uint8Array(positions.length);
+  const cellsPerByte = 8 / bitsPerCell(palette);
+  const magicCells = MAGIC.length * cellsPerByte;
+  if (positions.length < magicCells) {
+    throw new Error(
+      `decodeFrameWarped: payload too small to carry the magic (${positions.length} < ${magicCells})`,
+    );
+  }
   const half = cellSizePx / 2;
+
+  for (let rotation = 0; rotation < 4; rotation++) {
+    const assigned = rotateAssignment(imageCorners, rotation);
+    let h: Homography;
+    try {
+      h = computeHomography(canonical, assigned);
+    } catch {
+      continue; // singular system for this rotation — try the next
+    }
+    if (!magicMatches(g, palette, img, h, positions, magicCells, cellSizePx, half)) {
+      continue;
+    }
+    // Orientation found. Decode the full payload.
+    const cells = sampleAllCells(img, palette, h, positions, cellSizePx, half);
+    return { cells, orientation: rotation, imageCornerCentroids: imageCorners };
+  }
+
+  throw new Error(
+    "decodeFrameWarped: no rotation produced the expected magic — frame may be corrupted",
+  );
+}
+
+function magicMatches(
+  g: FrameGeometry,
+  palette: Palette,
+  img: RawImage,
+  h: Homography,
+  positions: ReadonlyArray<readonly [number, number]>,
+  magicCells: number,
+  cellSizePx: number,
+  half: number,
+): boolean {
+  void g;
+  const sampled = new Uint8Array(magicCells);
+  for (let i = 0; i < magicCells; i++) {
+    const [cx, cy] = positions[i]!;
+    const warped = applyHomography(h, {
+      x: cx * cellSizePx + half,
+      y: cy * cellSizePx + half,
+    });
+    const px = Math.round(warped.x);
+    const py = Math.round(warped.y);
+    if (px < 0 || py < 0 || px >= img.width || py >= img.height) return false;
+    sampled[i] = sampleNearestPalette(img, palette, px, py);
+  }
+  const bytes = cellsToBytes(sampled, palette);
+  for (let i = 0; i < MAGIC.length; i++) {
+    if (bytes[i] !== MAGIC[i]) return false;
+  }
+  return true;
+}
+
+function sampleAllCells(
+  img: RawImage,
+  palette: Palette,
+  h: Homography,
+  positions: ReadonlyArray<readonly [number, number]>,
+  cellSizePx: number,
+  half: number,
+): Uint8Array {
+  const out = new Uint8Array(positions.length);
   for (let i = 0; i < positions.length; i++) {
     const [cx, cy] = positions[i]!;
     const warped = applyHomography(h, {
@@ -515,38 +764,10 @@ export function decodeFrameWarped(
     const px = Math.round(warped.x);
     const py = Math.round(warped.y);
     if (px < 0 || py < 0 || px >= img.width || py >= img.height) {
-      // Cell sampled outside the image — leave as 0. Real receivers will
-      // mark this for ECC / retransmission.
       out[i] = 0;
       continue;
     }
     out[i] = sampleNearestPalette(img, palette, px, py);
   }
   return out;
-}
-
-function sampleNearestPalette(
-  img: RawImage,
-  palette: Palette,
-  x: number,
-  y: number,
-): number {
-  const o = (y * img.width + x) * 4;
-  const r = img.data[o]!;
-  const g = img.data[o + 1]!;
-  const b = img.data[o + 2]!;
-  let bestIdx = 0;
-  let bestDist = Infinity;
-  for (let i = 0; i < palette.colors.length; i++) {
-    const [pr, pg, pb] = palette.colors[i]!;
-    const dr = r - pr;
-    const dg = g - pg;
-    const db = b - pb;
-    const d = dr * dr + dg * dg + db * db;
-    if (d < bestDist) {
-      bestDist = d;
-      bestIdx = i;
-    }
-  }
-  return bestIdx;
 }

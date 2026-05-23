@@ -12,51 +12,87 @@ import {
   decodeFrame,
   decodeFrameWarped,
   detectFiducials,
-  detectionBoundsForCellSize,
+  detectPDPs,
   fiducialCanonicalCentroids,
   type Homography,
-  isFiducialMarkerCell,
+  otsuThreshold,
   payloadCellCount,
   payloadCellPositions,
+  pdpCellColour,
   type Point,
   type RawImage,
   renderFrame,
 } from "./framing";
 
+const MAGIC = [0x50, 0x48, 0x4f, 0x54] as const;
+
 describe("frame geometry", () => {
-  it("matches the design doc cell counts", () => {
-    // 64*64 - 4 corners*(4*4) - 1*16 config - 2*64 calibration = 3888
-    expect(payloadCellCount(DEFAULT_GEOMETRY)).toBe(3888);
+  it("matches the design doc cell counts after pivoting to 7×7 PDPs", () => {
+    // 64*64 - 4 corners*(7*7) - 1*16 config - 2*64 calibration = 3756
+    expect(payloadCellCount(DEFAULT_GEOMETRY)).toBe(3756);
   });
 
-  it("classifies corner cells as fiducial", () => {
+  it("classifies the four 7×7 corner blocks as fiducial", () => {
     expect(cellRole(DEFAULT_GEOMETRY, 0, 0)).toBe("fiducial");
-    expect(cellRole(DEFAULT_GEOMETRY, 3, 3)).toBe("fiducial");
+    expect(cellRole(DEFAULT_GEOMETRY, 6, 6)).toBe("fiducial");
+    expect(cellRole(DEFAULT_GEOMETRY, 7, 0)).not.toBe("fiducial");
+    expect(cellRole(DEFAULT_GEOMETRY, 0, 7)).not.toBe("fiducial");
+
+    expect(cellRole(DEFAULT_GEOMETRY, 57, 6)).toBe("fiducial");
     expect(cellRole(DEFAULT_GEOMETRY, 63, 0)).toBe("fiducial");
+    expect(cellRole(DEFAULT_GEOMETRY, 56, 0)).not.toBe("fiducial");
+
     expect(cellRole(DEFAULT_GEOMETRY, 0, 63)).toBe("fiducial");
     expect(cellRole(DEFAULT_GEOMETRY, 63, 63)).toBe("fiducial");
   });
 
-  it("classifies the config indicator strip", () => {
-    expect(cellRole(DEFAULT_GEOMETRY, 4, 0)).toBe("config");
-    expect(cellRole(DEFAULT_GEOMETRY, 19, 0)).toBe("config");
-    expect(cellRole(DEFAULT_GEOMETRY, 20, 0)).toBe("payload");
+  it("classifies the config indicator strip starting just past the TL fiducial", () => {
+    expect(cellRole(DEFAULT_GEOMETRY, 7, 0)).toBe("config");
+    expect(cellRole(DEFAULT_GEOMETRY, 22, 0)).toBe("config");
+    expect(cellRole(DEFAULT_GEOMETRY, 23, 0)).toBe("payload");
   });
 
-  it("classifies the calibration band", () => {
-    expect(cellRole(DEFAULT_GEOMETRY, 32, 4)).toBe("calibration");
-    expect(cellRole(DEFAULT_GEOMETRY, 32, 5)).toBe("calibration");
-    expect(cellRole(DEFAULT_GEOMETRY, 32, 6)).toBe("payload");
+  it("classifies the calibration band starting just below the fiducial row", () => {
+    expect(cellRole(DEFAULT_GEOMETRY, 32, 7)).toBe("calibration");
+    expect(cellRole(DEFAULT_GEOMETRY, 32, 8)).toBe("calibration");
+    expect(cellRole(DEFAULT_GEOMETRY, 32, 9)).toBe("payload");
   });
 
   it("enumerates payload positions in row-major order", () => {
     const positions = payloadCellPositions(DEFAULT_GEOMETRY);
-    expect(positions.length).toBe(3888);
+    expect(positions.length).toBe(3756);
     for (let i = 1; i < positions.length; i++) {
       const [x0, y0] = positions[i - 1]!;
       const [x1, y1] = positions[i]!;
       expect(y1 > y0 || (y1 === y0 && x1 > x0)).toBe(true);
     }
+  });
+});
+
+describe("PDP cell colouring", () => {
+  it("paints the outer ring black and the middle ring white", () => {
+    // Top-left fiducial (cells 0..6, 0..6). Cross-section through row 3
+    // should be ratio 1:1:3:1:1.
+    expect(pdpCellColour(DEFAULT_GEOMETRY, 0, 3)).toBe("black"); // outer
+    expect(pdpCellColour(DEFAULT_GEOMETRY, 1, 3)).toBe("white"); // middle
+    expect(pdpCellColour(DEFAULT_GEOMETRY, 2, 3)).toBe("black"); // inner
+    expect(pdpCellColour(DEFAULT_GEOMETRY, 3, 3)).toBe("black"); // inner
+    expect(pdpCellColour(DEFAULT_GEOMETRY, 4, 3)).toBe("black"); // inner
+    expect(pdpCellColour(DEFAULT_GEOMETRY, 5, 3)).toBe("white"); // middle
+    expect(pdpCellColour(DEFAULT_GEOMETRY, 6, 3)).toBe("black"); // outer
+  });
+
+  it("paints the same pattern in all four corners", () => {
+    // Centre of each PDP's inner 3×3 should be black.
+    expect(pdpCellColour(DEFAULT_GEOMETRY, 3, 3)).toBe("black"); // TL
+    expect(pdpCellColour(DEFAULT_GEOMETRY, 60, 3)).toBe("black"); // TR
+    expect(pdpCellColour(DEFAULT_GEOMETRY, 60, 60)).toBe("black"); // BR
+    expect(pdpCellColour(DEFAULT_GEOMETRY, 3, 60)).toBe("black"); // BL
+    // White ring cells in each corner.
+    expect(pdpCellColour(DEFAULT_GEOMETRY, 1, 1)).toBe("white"); // TL
+    expect(pdpCellColour(DEFAULT_GEOMETRY, 62, 1)).toBe("white"); // TR
+    expect(pdpCellColour(DEFAULT_GEOMETRY, 62, 62)).toBe("white"); // BR
+    expect(pdpCellColour(DEFAULT_GEOMETRY, 1, 62)).toBe("white"); // BL
   });
 });
 
@@ -77,7 +113,6 @@ describe("renderFrame / decodeFrame — pristine round-trip", () => {
   it("M1 done-when: 800 random bytes round-trip end-to-end", () => {
     const original = randomBytes(800, 0xface);
 
-    // bytes → cells → padded → render → decode → unpad → bytes
     const cells = bytesToCells(original, PALETTE_2BIT);
     const capacity = payloadCellCount(DEFAULT_GEOMETRY);
     expect(cells.length).toBeLessThanOrEqual(capacity);
@@ -113,49 +148,53 @@ describe("renderFrame / decodeFrame — pristine round-trip", () => {
   });
 });
 
-function randomBytes(n: number, seed: number): Uint8Array {
-  let s = seed >>> 0;
-  const out = new Uint8Array(n);
-  for (let i = 0; i < n; i++) {
-    s ^= s << 13;
-    s ^= s >>> 17;
-    s ^= s << 5;
-    out[i] = s & 0xff;
-  }
-  return out;
-}
+describe("Otsu adaptive thresholding", () => {
+  it("returns -1 for a uniform image", () => {
+    const img = solidImage(32, 32, 128);
+    expect(otsuThreshold(img)).toBe(-1);
+  });
 
-describe("fiducial marker geometry", () => {
-  it("marks the inner 2×2 of each 4-cell fiducial as marker cells", () => {
-    expect(isFiducialMarkerCell(DEFAULT_GEOMETRY, 0, 0)).toBe(false);
-    expect(isFiducialMarkerCell(DEFAULT_GEOMETRY, 1, 1)).toBe(true);
-    expect(isFiducialMarkerCell(DEFAULT_GEOMETRY, 2, 2)).toBe(true);
-    expect(isFiducialMarkerCell(DEFAULT_GEOMETRY, 3, 3)).toBe(false);
-
-    expect(isFiducialMarkerCell(DEFAULT_GEOMETRY, 61, 61)).toBe(true);
-    expect(isFiducialMarkerCell(DEFAULT_GEOMETRY, 62, 62)).toBe(true);
-    expect(isFiducialMarkerCell(DEFAULT_GEOMETRY, 63, 63)).toBe(false);
-
-    expect(isFiducialMarkerCell(DEFAULT_GEOMETRY, 10, 10)).toBe(false);
+  it("picks a threshold between two well-separated brightness modes", () => {
+    // 32×32 image, half pixels at luminance ~30, half at ~210. Otsu's
+    // optimum threshold should land between the two modes.
+    const img = bimodalImage(32, 32, 30, 210);
+    const t = otsuThreshold(img);
+    expect(t).toBeGreaterThanOrEqual(30);
+    expect(t).toBeLessThan(210);
   });
 });
 
-describe("fiducial detection on a pristine frame", () => {
-  it("locates the four fiducial centroids at their canonical positions", () => {
+describe("PDP detection", () => {
+  it("finds four PDPs at the canonical positions in a pristine frame", () => {
     const cellSizePx = 8;
     const cells = new Uint8Array(payloadCellCount(DEFAULT_GEOMETRY));
     const img = renderFrame(DEFAULT_GEOMETRY, PALETTE_2BIT, cells, cellSizePx);
 
-    const detected = detectFiducials(
-      img,
-      detectionBoundsForCellSize(cellSizePx),
-    );
+    const detected = detectFiducials(img);
     expect(detected).not.toBeNull();
-    const canonical = fiducialCanonicalCentroids(DEFAULT_GEOMETRY, cellSizePx);
 
+    // Should match the canonical positions in image-corner order. With a
+    // pristine frame and no warp, image-corner order == sender-frame order.
+    const canonical = fiducialCanonicalCentroids(DEFAULT_GEOMETRY, cellSizePx);
     for (let i = 0; i < 4; i++) {
       expect(detected![i]!.x).toBeCloseTo(canonical[i]!.x, 0);
       expect(detected![i]!.y).toBeCloseTo(canonical[i]!.y, 0);
+    }
+  });
+
+  it("returns at least four candidates on a pristine frame, with sensible area ratios", () => {
+    const cellSizePx = 8;
+    const cells = new Uint8Array(payloadCellCount(DEFAULT_GEOMETRY));
+    const img = renderFrame(DEFAULT_GEOMETRY, PALETTE_2BIT, cells, cellSizePx);
+
+    const t = otsuThreshold(img);
+    const candidates = detectPDPs(img, t);
+    expect(candidates.length).toBeGreaterThanOrEqual(4);
+
+    for (const c of candidates) {
+      // Canonical area ratio is 16/9 ≈ 1.78; widen for tolerance.
+      expect(c.areaRatio).toBeGreaterThan(0.6);
+      expect(c.areaRatio).toBeLessThan(4.0);
     }
   });
 });
@@ -221,37 +260,129 @@ describe("M3 done-when: decode a rotated, scaled, perspective-warped frame", () 
       ] as [Point, Point, Point, Point],
     },
   ])("$name", ({ dst }) => {
-    // Render a pristine frame with a deterministic payload.
-    const original = randomBytes(800, 0xfeed);
-    const cells = bytesToCells(original, PALETTE_2BIT);
-    const capacity = payloadCellCount(DEFAULT_GEOMETRY);
-    const padded = new Uint8Array(capacity);
-    padded.set(cells);
-    const pristine = renderFrame(
-      DEFAULT_GEOMETRY,
-      PALETTE_2BIT,
-      padded,
-      cellSizePx,
-    );
-
-    // Warp it into a larger output buffer.
-    const src = fiducialCanonicalCentroids(DEFAULT_GEOMETRY, cellSizePx);
-    const inverse = computeHomography(dst, src);
-    const warped = warpImage(pristine, inverse, 800, 720);
-
-    // Detect + unwarp + decode.
-    const decoded = decodeFrameWarped(
+    const { warped, original } = renderWarped(dst);
+    const result = decodeFrameWarped(
       DEFAULT_GEOMETRY,
       PALETTE_2BIT,
       warped,
       cellSizePx,
     );
-    const trimmed = decoded.slice(0, cells.length);
+    // Should land on orientation 0 — these warps are perspective only, no rotation.
+    expect(result.orientation).toBe(0);
+    const trimmed = result.cells.slice(0, bytesToCells(original, PALETTE_2BIT).length);
     const restored = cellsToBytes(trimmed, PALETTE_2BIT);
-
     expect(restored).toEqual(original);
   });
 });
+
+describe("M3.5 done-when: decode at any of the four cardinal camera orientations", () => {
+  const cellSizePx = 8;
+
+  it.each([
+    { name: "upright", rotateImage: 0 },
+    { name: "90° CW", rotateImage: 1 },
+    { name: "180°", rotateImage: 2 },
+    { name: "90° CCW", rotateImage: 3 },
+  ])("$name → orientation $rotateImage", ({ rotateImage }) => {
+    const dst: [Point, Point, Point, Point] = [
+      { x: 120, y: 110 },
+      { x: 660, y: 80 },
+      { x: 690, y: 620 },
+      { x: 90, y: 590 },
+    ];
+    const { warped, original } = renderWarped(dst);
+    const rotated = rotateImageK(warped, rotateImage);
+
+    const result = decodeFrameWarped(
+      DEFAULT_GEOMETRY,
+      PALETTE_2BIT,
+      rotated,
+      cellSizePx,
+    );
+    expect(result.orientation).toBe(rotateImage);
+    const trimmed = result.cells.slice(0, bytesToCells(original, PALETTE_2BIT).length);
+    const restored = cellsToBytes(trimmed, PALETTE_2BIT);
+    expect(restored).toEqual(original);
+  });
+});
+
+// -------------------------------------------------------------------------
+// Helpers
+// -------------------------------------------------------------------------
+
+/**
+ * Build a payload whose first 4 bytes are the PHOT magic, with the rest
+ * pseudo-random and deterministic from a seed. Used by every warped-decode
+ * test, since `decodeFrameWarped` now recovers orientation by validating
+ * the magic at the start of the byte stream.
+ */
+function makeMagicPayload(byteCount: number, seed: number): Uint8Array {
+  const out = randomBytes(byteCount, seed);
+  for (let i = 0; i < MAGIC.length; i++) out[i] = MAGIC[i]!;
+  return out;
+}
+
+/**
+ * Render a frame with magic-prefixed payload, then warp it into a 800×720
+ * output buffer using `dst` as the warped fiducial centroids.
+ */
+function renderWarped(
+  dst: [Point, Point, Point, Point],
+): { warped: RawImage; original: Uint8Array } {
+  const cellSizePx = 8;
+  const original = makeMagicPayload(800, 0xfeed);
+  const cells = bytesToCells(original, PALETTE_2BIT);
+  const capacity = payloadCellCount(DEFAULT_GEOMETRY);
+  const padded = new Uint8Array(capacity);
+  padded.set(cells);
+  const pristine = renderFrame(
+    DEFAULT_GEOMETRY,
+    PALETTE_2BIT,
+    padded,
+    cellSizePx,
+  );
+  const src = fiducialCanonicalCentroids(DEFAULT_GEOMETRY, cellSizePx);
+  const inverse = computeHomography(dst, src);
+  const warped = warpImage(pristine, inverse, 800, 720);
+  return { warped, original };
+}
+
+/**
+ * Rotate an image by k * 90° clockwise. k in 0..3.
+ * Used to simulate the camera being held at different cardinal orientations.
+ */
+function rotateImageK(src: RawImage, k: number): RawImage {
+  k = ((k % 4) + 4) % 4;
+  if (k === 0) return src;
+  const w = src.width;
+  const h = src.height;
+  const newW = k % 2 === 0 ? w : h;
+  const newH = k % 2 === 0 ? h : w;
+  const data = new Uint8ClampedArray(newW * newH * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let nx = x;
+      let ny = y;
+      if (k === 1) { // 90° CW
+        nx = h - 1 - y;
+        ny = x;
+      } else if (k === 2) { // 180°
+        nx = w - 1 - x;
+        ny = h - 1 - y;
+      } else if (k === 3) { // 270° CW = 90° CCW
+        nx = y;
+        ny = w - 1 - x;
+      }
+      const o = (y * w + x) * 4;
+      const no = (ny * newW + nx) * 4;
+      data[no] = src.data[o]!;
+      data[no + 1] = src.data[o + 1]!;
+      data[no + 2] = src.data[o + 2]!;
+      data[no + 3] = src.data[o + 3]!;
+    }
+  }
+  return { data, width: newW, height: newH };
+}
 
 /**
  * Inverse-mapped bilinear warp: for every output pixel, sample the input
@@ -291,4 +422,39 @@ function warpImage(
     }
   }
   return { data, width: outW, height: outH };
+}
+
+function solidImage(w: number, h: number, luminance: number): RawImage {
+  const data = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0; i < data.length; i += 4) {
+    data[i] = luminance;
+    data[i + 1] = luminance;
+    data[i + 2] = luminance;
+    data[i + 3] = 255;
+  }
+  return { data, width: w, height: h };
+}
+
+function bimodalImage(w: number, h: number, dark: number, bright: number): RawImage {
+  const data = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0; i < data.length; i += 4) {
+    const v = (i / 4) % 2 === 0 ? dark : bright;
+    data[i] = v;
+    data[i + 1] = v;
+    data[i + 2] = v;
+    data[i + 3] = 255;
+  }
+  return { data, width: w, height: h };
+}
+
+function randomBytes(n: number, seed: number): Uint8Array {
+  let s = seed >>> 0;
+  const out = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    s ^= s << 13;
+    s ^= s >>> 17;
+    s ^= s << 5;
+    out[i] = s & 0xff;
+  }
+  return out;
 }
