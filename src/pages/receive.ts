@@ -69,24 +69,14 @@ captureButton.addEventListener("click", () => {
 
   const rawImage = { data: imageData.data, width: w, height: h };
 
-  // Pixel-area bounds for fiducial markers. The expected size depends on
-  // how the sender's canvas is framed in the camera view — for a typical
-  // phone-camera-at-laptop or laptop-camera-at-phone setup, marker clusters
-  // land between 50 and 20000 pixels. M5+ will tighten this.
-  const detectionBounds = {
-    minClusterPixels: 50,
-    maxClusterPixels: 20000,
-  };
-
   try {
-    const cells = decodeFrameWarped(
+    const result = decodeFrameWarped(
       DEFAULT_GEOMETRY,
       PALETTE_2BIT,
       rawImage,
       8,
-      detectionBounds,
     );
-    const bytes = cellsToBytes(cells, PALETTE_2BIT);
+    const bytes = cellsToBytes(result.cells, PALETTE_2BIT);
     const packet = decodePacket(bytes, M4_SESSION);
 
     if (!packet) {
@@ -100,8 +90,9 @@ captureButton.addEventListener("click", () => {
     }
 
     const looksLikePng = isPngHeader(packet.payload);
+    const orientationLabel = ["upright", "90° CW", "180°", "90° CCW"][result.orientation] ?? `rotation ${result.orientation}`;
     output.textContent =
-      `✓ Packet accepted\n` +
+      `✓ Packet accepted (camera held ${orientationLabel})\n` +
       `Session 0x${packet.sessionId.toString(16)}, offset ${packet.payloadOffset}, payload ${packet.payload.length} bytes\n` +
       (looksLikePng ? `✓ Payload starts with the PNG magic (89 50 4E 47 …)\n` : `(payload does not start with a known magic)\n`) +
       `\nFirst 64 bytes of payload:\n${formatHex(packet.payload.slice(0, 64))}`;
