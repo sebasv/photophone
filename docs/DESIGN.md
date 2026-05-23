@@ -199,6 +199,75 @@ Properties that matter for Photophone:
 - Each receiver independently accumulates encoded packets until it has enough to decode.
 - Sender keeps looping until manually stopped — extra encoded packets are just extra redundancy for receivers with worse channel conditions.
 
+### 6.1 Back-channel modalities — visual vs audio
+
+The unicast back-channel (receiver → sender, for ACK / NACK / handshake / continuous adaptation) is the gate to M11–M14. We currently plan a **visual** channel (receiver renders a frame on its own screen, the sender's camera reads it). An **audio** back-channel — receiver emits acoustic chirps, the sender's microphone captures them — is a serious alternative worth holding open.
+
+#### Why audio is on-theme, not off-theme
+
+Alexander Graham Bell's 1880 photophone transmitted **speech over light** (a flexible mirror modulated by the speaker's voice, a selenium photocell on the other end). The historical device that this project is named after was an audio-over-light apparatus. Adding audio doesn't betray "photons only" — it completes the metaphor the project is already drawing on. "Two computers seeing each other" and "two computers talking to each other" together form a richer chord than either alone.
+
+#### What audio solves that the visual back-channel doesn't
+
+- **Spatial flexibility.** The visual back-channel needs both devices to have a camera pointed at the other's screen — which is awkward for laptops (front-facing camera + front-facing screen = you cannot easily set up bidirectional camera↔screen between two laptops). Audio is omnidirectional: if both devices can hear each other, the back-channel works regardless of physical orientation.
+- **Higher available bandwidth.** A 44.1 kHz microphone with a modest 1000-baud FSK encoding carries hundreds of bytes per second — far more than the visual back-channel, which is bounded by camera frame rate × per-frame cell capacity.
+- **No second camera required.** The sender uses its mic, not its camera, for the back-channel. Laptops and phones already have a microphone; no extra hardware.
+
+#### Why we'd still want photons-only for the *main* data path
+
+- **Core thesis.** "Two screens, only photons" is the project's identity. The main data path stays visual.
+- **Acoustic environments are noisy in practice.** Rooms with music, conversation, fans, HVAC. The visual channel is robust to ambient noise; audio isn't. The visual back-channel remains the canonical reference implementation.
+- **Demo legibility.** "Photophone via screen + camera only" is a cleaner headline than "screen + camera + speaker + mic."
+
+#### Technical approach
+
+Simplest viable encoding: **FSK (Frequency-Shift Keying)**. Two distinct audio tones encode bit 0 and bit 1.
+
+- Sender (= receiver of data, emitting back-channel): `OscillatorNode` via the Web Audio API, switching frequency per bit.
+- Receiver (= data sender, listening): `MediaStreamAudioSourceNode` → `AnalyserNode`, FFT per chunk, detect which tone is dominant.
+
+Two frequency choices to consider:
+
+- **Audible range** (e.g. 1000 Hz and 1500 Hz). Easy to detect, easy to debug ("you can hear it working"), but obviously noisy in shared spaces.
+- **Near-ultrasonic** (17–20 kHz). Inaudible to most adults, still well within most consumer mic/speaker frequency response. Same FFT, just different tones. This is what commercial data-over-sound systems use.
+
+For ACKs and NACK ranges we need maybe 20–60 bytes per packet, easily within FSK's reach. For higher throughput we'd graduate to PSK / QAM / OFDM, but that's overkill for what the back-channel needs.
+
+Prior art worth studying:
+- **ggwave** (MIT-ish) — small, focused library doing exactly this in audible / near-ultrasonic ranges. JS bindings exist.
+- **Quiet Modem Project** (MIT) — fuller-featured OFDM/PSK acoustic modem in WebAssembly.
+- **Chirp** (commercial, no longer maintained) — the historical reference for "data over audio."
+
+#### How it fits in the milestone graph
+
+M11–M14 currently treat the back-channel as a single resource (visual). To accommodate audio cleanly, the milestones can split:
+
+- **M11a — Visual back-channel** (the existing M11)
+- **M11b — Audio back-channel** (new; stretch / power-user)
+
+Everything M12–M14 depends on "a back-channel exists" and doesn't care which modality is wired up. The receiver UI would offer a toggle: "back-channel via screen" (default) or "back-channel via audio."
+
+#### Recommendation
+
+Do **M11a (visual)** first as the canonical reference implementation — keeps the project's philosophical purity intact and forces us to solve bidirectional optical alignment. Add **M11b (audio)** as a stretch milestone, primarily for demos where the spatial setup makes the visual back-channel impractical (e.g., two laptops at a meetup table).
+
+#### Audible-mode toggle (opt-in for quirk)
+
+Near-ultrasonic (17–20 kHz) is the right *default* for the audio back-channel — invisible to the ear, no interference with conversation, no startled bystanders. But there's a strong product argument for a toggle that **moves the FSK tones into the human-audible range** (say 1000–2000 Hz) on demand: it lets a person *witness* the back-channel in action. The whole point of the project is making computers communicate in ways humans can perceive — photons are already visible, the bytes-as-colours are right there. Letting the audio be audible by request is exactly the kind of quirk that fits the photophone metaphor.
+
+Concretely: a single toggle on the receiver page, off by default. When on, the FSK tone pair drops from `(f₀_ultra, f₁_ultra)` into `(f₀_audible, f₁_audible)`. Encoding and protocol are otherwise identical; only the carrier frequencies change. The user gets to *hear* the ACKs and NACKs flying between the two devices.
+
+Why this is worth shipping (when M11b lands):
+- Demos / meetups where the audible duet is the punchline.
+- Pedagogical value — teaches data-over-sound viscerally without anyone having to explain "this is real, just trust me, ultrasonic."
+- Debugging — audible tones tell you that the device IS emitting something even when detection isn't working.
+
+#### What we explicitly don't want
+
+- **Audio for the main data path.** That would dilute the project's identity.
+- **Audible audio *as default*.** Audible mode is opt-in — it lights up because the user asked for it. Default is near-ultrasonic. A polite beep, never a continuous chirp.
+
+
 ## 7. Open questions
 
 ### Decided
@@ -356,6 +425,7 @@ After detection, verify the four chosen PDP centroids form a roughly-convex quad
 - Receiver page can render a small dedicated channel frame (lower fps, larger cells acceptable) on its own screen.
 - Sender page can open its own camera, find this channel, and decode it.
 - This is shared infrastructure for M12, M13, M14 — get it solid before layering features.
+- M11b is a planned alternative back-channel modality (audio via FSK over Web Audio) — see §6.1. Same interface, different physical channel; M12–M14 don't care which is wired up.
 - **Done when:** a manually-crafted "hello back" message displayed by the receiver is decoded by the sender's camera within 2 seconds.
 
 ### M12 — Handshake-time link negotiation (static adaptation)
