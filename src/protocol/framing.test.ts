@@ -307,6 +307,93 @@ describe("M3.5 done-when: decode at any of the four cardinal camera orientations
   });
 });
 
+describe("PDP selection — false-positive rejection", () => {
+  const cellSizePx = 8;
+
+  it("prefers four real PDPs over a false positive sitting closer to an image corner", () => {
+    // Render a perspective-warped frame, then paint a fake PDP-shaped blob
+    // in the empty image area near the top-left corner — *closer to image-TL*
+    // than the real TL fiducial. This is the user's M4.5-observed scenario:
+    // small UI elements (page text, browser buttons) nearer an image edge
+    // than the canvas's actual PDPs.
+    const dst: [Point, Point, Point, Point] = [
+      { x: 120, y: 110 },
+      { x: 660, y: 80 },
+      { x: 690, y: 620 },
+      { x: 90, y: 590 },
+    ];
+    const { warped, original } = renderWarped(dst);
+
+    const fakeCX = 50;
+    const fakeCY = 50; // closer to image-TL (0,0) than the real TL at (120,110)
+    paintFakePDP(warped, fakeCX, fakeCY, 14, 8);
+
+    const result = decodeFrameWarped(
+      DEFAULT_GEOMETRY,
+      PALETTE_2BIT,
+      warped,
+      cellSizePx,
+    );
+    expect(result.orientation).toBe(0);
+    const trimmed = result.cells.slice(0, bytesToCells(original, PALETTE_2BIT).length);
+    expect(cellsToBytes(trimmed, PALETTE_2BIT)).toEqual(original);
+
+    // Confirm the fake was a viable candidate (i.e. the test actually
+    // exercises the selector, not just "detector ignored it").
+    const dx = decodeFrameWarpedWithDiagnostics(
+      DEFAULT_GEOMETRY,
+      PALETTE_2BIT,
+      warped,
+      cellSizePx,
+    );
+    const sawFake = dx.detection.allCandidates.some(
+      (c) =>
+        Math.abs(c.centroid.x - fakeCX) < 25 &&
+        Math.abs(c.centroid.y - fakeCY) < 25,
+    );
+    expect(sawFake).toBe(true);
+
+    // And the chosen four should NOT include the fake.
+    const chosenIncludesFake = dx.detection.chosen!.some(
+      (p) => Math.abs(p.x - fakeCX) < 25 && Math.abs(p.y - fakeCY) < 25,
+    );
+    expect(chosenIncludesFake).toBe(false);
+  });
+});
+
+/**
+ * Paint a fake PDP-shaped pattern (white ring around a dark centre) onto
+ * the image at (cx, cy). Used by the false-positive rejection test to
+ * inject a structurally-PDP-like artefact that the selector must reject.
+ */
+function paintFakePDP(
+  img: RawImage,
+  cx: number,
+  cy: number,
+  outerRadius: number,
+  innerRadius: number,
+): void {
+  for (let dy = -outerRadius; dy <= outerRadius; dy++) {
+    for (let dx = -outerRadius; dx <= outerRadius; dx++) {
+      const r2 = dx * dx + dy * dy;
+      const x = cx + dx;
+      const y = cy + dy;
+      if (x < 0 || y < 0 || x >= img.width || y >= img.height) continue;
+      const o = (y * img.width + x) * 4;
+      if (r2 <= innerRadius * innerRadius) {
+        img.data[o] = 0;
+        img.data[o + 1] = 0;
+        img.data[o + 2] = 0;
+      } else if (r2 <= outerRadius * outerRadius) {
+        img.data[o] = 255;
+        img.data[o + 1] = 255;
+        img.data[o + 2] = 255;
+      }
+      img.data[o + 3] = 255;
+    }
+  }
+}
+
 // -------------------------------------------------------------------------
 // Helpers
 // -------------------------------------------------------------------------
