@@ -288,11 +288,24 @@ Why this is dramatically more robust than the current 4×4 detector:
 
 **Cost:** 7×7 = 49 cells per fiducial × 4 corners = 196 cells, up from 64 today. Net payload impact: **−132 cells = −3.4%**. Acceptable; the robustness payoff justifies it.
 
-#### 3. Orientation strategy
+#### 3. Orientation via magic validation in all four rotations
 
-Three options on the table; argument and decision happen in the implementation PR. The four-identical-PDPs render gives us no asymmetry, so we need to add it somewhere — either in the rendered pattern, or in how the receiver decides which corner is TL.
+All four PDPs render identically; orientation is recovered *after* detection. For each of the four rotational assignments of the detected PDP centroids to the canonical TL/TR/BR/BL slots, compute the homography, sample the first 16 payload cells (= 4 bytes), and accept the rotation whose magic decodes to `"PHOT"` (`0x50 0x48 0x4F 0x54`).
 
-(Stub here; finalize before the implementation PR opens.)
+Properties:
+
+- **Zero rendered-frame asymmetry.** All four PDPs are pixel-identical; the orientation signal lives in the already-required packet header, not in the fiducial pattern.
+- **False-positive probability ≈ 2⁻³² per non-matching rotation.** Three non-matching rotations × 2⁻³² ≈ 1 in 1.4 billion that a wrong rotation accidentally decodes to the magic. Effectively never happens.
+- **Cost is negligible:** 4 × (8×8 linear solve + 16-cell sample + 4-byte assembly). Microseconds.
+- **Loose coupling.** No dependence on render-layout asymmetry, satellite markers, or fiducial-pattern variants. Changes to the palette, frame size, or fiducial geometry all leave the orientation logic untouched.
+
+The detector's output carries an `orientation: 0 | 1 | 2 | 3` field so M4.5's diagnostics overlay can surface which rotation was accepted and which magic bytes the other three rotations produced.
+
+Rejected alternatives:
+
+- **Satellite marker beside the TL fiducial.** Adds a new render artefact, a separate detector path, and its own false-positive surface. Weaker math than the magic's 32 bits of entropy.
+- **QR-style asymmetric TL fiducial (3+1).** Forces two PDP detector paths and necessarily weakens the TL pattern's ratio match by deviating from 1:1:3:1:1.
+- **CRC32 in the bootstrap region instead of the magic.** Equivalent entropy (32 bits) but depends on M9's bootstrap parser; the magic check already exists in the decode pipeline.
 
 #### 4. Geometry plausibility sanity check (optional, low effort)
 
