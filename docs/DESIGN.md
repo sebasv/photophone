@@ -241,29 +241,68 @@ A note on ordering: the forward-only unicast pipeline (M1–M8) is *almost* broa
 - Decode the config indicator first (worst-case parameters), then the rest of the frame.
 - **Done when:** the receiver decodes a frame that's been programmatically rotated, scaled, and perspective-warped (still synthetic, no camera) without errors.
 
-### M3.5 — Orientation-invariant fiducials
-**Motivation — two problems discovered during M4 manual testing:**
+### M3.5 — Robust fiducial detection
+**Motivation — three failures discovered during M4 manual testing:**
 
-1. **Orientation.** `detectFiducials` assigns blobs to corners by Manhattan distance to *image* corners, which is rotation-blind: rotate the camera 180° and the receiver labels what was the sender's TL as BR, so cells decode back-to-front.
+1. **Lighting brittleness.** The detector uses `r > 200 && g > 200 && b > 200`. That threshold was tuned for an indoor scene where the camera's auto-exposure metered against a dark room. Outside in daylight the camera meters against bright surroundings, gain drops, and the actual fiducial pixels come back at maybe `(180, 180, 195)` — silently failing the threshold even though nothing about the fiducial itself changed.
 
-2. **False positives.** Any white blob over the `>200`-on-all-three-channels marker threshold that survives the size filter is a candidate. White letters on the sender page (page title "Send", button labels, status text — all rendered in `#f5f5f5`) easily pass both, and when they sit closer to image corners than the actual fiducial markers they win the corner-assignment. The decoder then samples cells from wherever the misled homography lands — typically off-frame — and gets mostly zeros back. PR #8 ships a defence-in-depth (sender page text recoloured to a camera-safe palette), but the structural fix belongs here.
+2. **False positives from arbitrary bright shapes.** Any blob over the threshold that survives the size filter is a candidate. White letters on the sender page (`#f5f5f5` until the PR #8 fix), a laptop bezel under outdoor light, paper in the frame — all can pass. When such a blob sits closer to an image corner than a real fiducial, it wins the corner-assignment heuristic and the homography lands sampling off-frame.
 
-Both problems are fixed by the same change: make the top-left fiducial **shape-distinctive** rather than just "the largest white blob in the top-left quadrant."
+3. **Orientation.** `detectFiducials` assigns blobs to corners by Manhattan distance to *image* corners, which is rotation-blind: rotate the camera 180° and the receiver labels what was the sender's TL as BR, so cells decode back-to-front.
 
-**Why not just add a quiet zone (margin of black) around each fiducial?** Because letters on a dark page already have black around them; the surrounding margin is visually identical to a fiducial's outer ring. Whitespace separates content from noise but doesn't *characterise* fiducial-ness. The fix has to constrain shape, not surroundings.
+**Why not "just add a quiet zone" around each fiducial?** Letters on a dark page already have black around them; surrounding margin is visually identical to a fiducial's outer ring. Whitespace separates content from noise but doesn't *characterise* fiducial-ness. The fix has to constrain the marker's shape, not its surroundings.
 
-QR codes solve this with concentric finder patterns (1:1:3:1:1 black:white:black:white:black ratio across the middle of each PDP), which random objects essentially never match. Photophone uses the cheaper L-vs-square shape distinction — one bit of asymmetry on one corner — which gives us both orientation and structural rejection at no cost in payload area.
+**Approach — pivot to QR-style detection.** Two changes together; orientation strategy still TBD (see "Open: orientation strategy" below).
 
-**Approach:**
+#### 1. Otsu's adaptive thresholding
 
-- Make the top-left fiducial's inner marker an **L-shape** (3 cells out of the 2×2 inner area), keeping the other three fiducials' inner markers as solid 2×2 squares. This breaks the rotational symmetry of the four corner markers *and* adds a shape constraint that arbitrary white blobs do not satisfy.
-- In `detectFiducials`, compute each cluster's **fill ratio** (`pixelCount / bboxArea`). The cluster with the lowest fill ratio (~0.75) is the top-left. Require fill ratio ≈ 1.0 (within tolerance) for the other three — this is what rejects letters and other random white shapes whose bounding boxes are mostly empty space. Order the remaining three by clockwise angle around the centroid of all four to recover TR / BR / BL.
-- Fill ratio is a ratio of areas — projectively invariant — so the classification holds regardless of camera rotation, scale, or perspective.
-- A nice side effect: a human glancing at the rendered frame can tell at a glance which corner is "top-left", confirming the sender's intended orientation without a second device.
-- **Done when:**
-  - The same payload decodes correctly with the camera held at any of the four cardinal orientations (0°, 90° CW, 180°, 90° CCW).
-  - White text and other arbitrary white shapes in the camera frame are rejected as candidates, even when they sit closer to image corners than the actual fiducials.
-  - Verified with both synthetic-warp tests (rotated inputs to `decodeFrameWarped`) and the M4 manual capture loop without manually obscuring sender-page UI.
+Replace the constant `>200` with a per-frame threshold derived from the image's brightness histogram. Otsu picks the threshold that maximises the between-class variance of "dark vs. bright" pixels — i.e., the value that best separates foreground from background in *this specific* frame. No magic constants survive across lighting conditions.
+
+- Compute a 256-bin luminance histogram of the camera frame
+- Walk the threshold from 1..254, keep the value that maximises `w_dark · w_bright · (μ_bright − μ_dark)²`
+- Use that threshold (and a tolerance band) as the marker-pixel test
+
+Independent of fiducial shape. Solves the outdoor/indoor problem. ~80 lines, no dependencies, well-documented algorithm.
+
+#### 2. 7×7 Position Detection Patterns (PDPs) at all four corners
+
+Replace the 4×4 "outer ring + 2×2 inner marker" fiducial with a 7×7 nested-ring pattern that mirrors QR codes' finder pattern:
+
+```
+■ ■ ■ ■ ■ ■ ■
+■ □ □ □ □ □ ■
+■ □ ■ ■ ■ □ ■
+■ □ ■ ■ ■ □ ■
+■ □ ■ ■ ■ □ ■
+■ □ □ □ □ □ ■
+■ ■ ■ ■ ■ ■ ■
+```
+
+The signature property: any horizontal or vertical line through the centre crosses five bands in **1:1:3:1:1** width ratio (`black:white:black:white:black`). The detector scans rows then columns looking for run-length sequences matching that ratio within a width tolerance; two independent confirmations (one row, one column) per pattern, four patterns per frame.
+
+Why this is dramatically more robust than the current 4×4 detector:
+
+- **The ratio is overwhelmingly improbable in nature.** A bezel, a letter, a reflection — none have a sharp dark ring around a bright ring around a dark centre with the right proportions. Bezels would have width ratios like `1:0.5:100:0.5:1` (the bright screen content fills most of the line) and fail.
+- **No separate "anti-bezel" or "anti-letter" checks needed.** The ratio test alone subsumes them.
+- **Decades of empirical hardening.** Every corner case has already been found and fixed in published implementations.
+
+**Cost:** 7×7 = 49 cells per fiducial × 4 corners = 196 cells, up from 64 today. Net payload impact: **−132 cells = −3.4%**. Acceptable; the robustness payoff justifies it.
+
+#### 3. Orientation strategy
+
+Three options on the table; argument and decision happen in the implementation PR. The four-identical-PDPs render gives us no asymmetry, so we need to add it somewhere — either in the rendered pattern, or in how the receiver decides which corner is TL.
+
+(Stub here; finalize before the implementation PR opens.)
+
+#### 4. Geometry plausibility sanity check (optional, low effort)
+
+After detection, verify the four chosen PDP centroids form a roughly-convex quadrilateral with reasonable aspect ratio (say 0.5–2.0) and reasonable image-area fraction (e.g. 5%–80%). Cheap to add (~30 lines) and catches the residual edge cases where four valid PDP-passing patches are arranged implausibly. Skip if the PDP detector alone proves robust enough in practice.
+
+**Done when:**
+- A single PNG decodes correctly under all of: dim indoor light, outdoor daylight, mixed lighting, and the camera held at any of the four cardinal orientations.
+- A wider camera view that includes the laptop bezel still decodes correctly — the bezel does not win corner assignment.
+- No manual covering of sender-page UI required.
+- Synthetic-warp tests still pass (rotated inputs to `decodeFrameWarped`).
 
 ### M4 — First camera capture
 - Receiver page: snap a still frame from `getUserMedia`, decode it.
