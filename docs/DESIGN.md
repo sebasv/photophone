@@ -380,6 +380,30 @@ Rejected alternatives:
 
 After detection, verify the four chosen PDP centroids form a roughly-convex quadrilateral with reasonable aspect ratio (say 0.5–2.0) and reasonable image-area fraction (e.g. 5%–80%). Cheap to add (~30 lines) and catches the residual edge cases where four valid PDP-passing patches are arranged implausibly. Skip if the PDP detector alone proves robust enough in practice.
 
+#### 5. Deferred refinements
+
+Two detector ideas considered but not shipped in M3.5. Logged here with a "pick up when…" trigger so the deferral is explicit and the reasoning is preserved for whoever revisits this section.
+
+##### a. Staggered topology / outer-band area ratio
+
+**Idea.** Extend the area-ratio check to a third layer. Currently we verify `D_inner ⊂ W_ring` with `W/D ≈ 16/9`. The natural extension is to verify an *outer dark band* immediately around `W_ring` with thickness ≈ 1/3 of the centre. Done as area ratios it is **projectively invariant** — strictly more perspective-robust than the 1:1:3:1:1 cross-section we landed in §8 M3.5 #3.
+
+**Why deferred.** The cross-section verifier is already cheap (~30 ops worst case per candidate) and effective on the failure modes M4.5 surfaced. The staggered outer-band check needs morphological dilation around each candidate's `W_ring` to isolate the immediate annulus from the page-background connected component — another full pixel pass per candidate. For typical handheld camera angles, the cross-section's perspective sensitivity is well within tolerance.
+
+**Pick up when:**
+- Manual testing reveals false-positive leaks under extreme perspective (camera approaching screen-edge-on), where cross-section starts failing under heavy band-width distortion.
+- Or: a structural false positive emerges in the wild that passes both flood-fill containment *and* cross-section verification.
+
+##### b. Locality-restructured detector (one flood-fill instead of two)
+
+**Idea.** Currently `detectPDPs` runs `findComponents` twice — once for whites, once for darks. Restructure to: flood-fill *only* dark components, then per-candidate localised expansion to find each candidate's surrounding white ring (sampling pixels in the annulus just outside the dark's bbox, rather than committing the whole image's white pixels to a connected-components pass).
+
+**Why deferred.** Detection is currently well under budget (<5ms total on a 1080p frame; the connected-components passes are ~2ms each). This refactor would save ~2ms — a real number, but optimisation isn't a problem yet. The current structure is also more obviously correct under inspection; locality changes invite bugs.
+
+**Pick up when:**
+- Profiling shows detection in the hot loop dominating frame time (>15ms on real hardware).
+- Or: M6 (continuous capture) demands a frame budget the current detector can't meet.
+
 **Done when:**
 - A single PNG decodes correctly under all of: dim indoor light, outdoor daylight, mixed lighting, and the camera held at any of the four cardinal orientations.
 - A wider camera view that includes the laptop bezel still decodes correctly — the bezel does not win corner assignment.
