@@ -91,10 +91,19 @@ captureButton.addEventListener("click", () => {
 
     const looksLikePng = isPngHeader(packet.payload);
     const orientationLabel = ["upright", "90° CW", "180°", "90° CCW"][result.orientation] ?? `rotation ${result.orientation}`;
+    const firstEight = formatHexInline(packet.payload.slice(0, 8));
+    const pngLine = looksLikePng
+      ? `   ✓ PNG file signature (89 50 4E 47 0D 0A 1A 0A) matched — payload looks intact`
+      : `   ✗ Expected PNG file signature 89 50 4E 47 0D 0A 1A 0A; got ${firstEight} — some payload cells likely misclassified`;
+    // Two distinct integrity layers: the packet header's PHOT magic
+    // (verified by decodeFrameWarped's orientation logic and again by
+    // decodePacket) and the PNG file signature inside the payload.
     output.textContent =
       `✓ Packet accepted (camera held ${orientationLabel})\n` +
-      `Session 0x${packet.sessionId.toString(16)}, offset ${packet.payloadOffset}, payload ${packet.payload.length} bytes\n` +
-      (looksLikePng ? `✓ Payload starts with the PNG magic (89 50 4E 47 …)\n` : `(payload does not start with a known magic)\n`) +
+      `   • PHOT magic + version + session 0x${packet.sessionId.toString(16).padStart(8, "0")} all valid\n` +
+      `   • Payload offset ${packet.payloadOffset}, length ${packet.payload.length} bytes\n` +
+      `\nFile-content sanity check:\n` +
+      `${pngLine}\n` +
       `\nFirst 64 bytes of payload:\n${formatHex(packet.payload.slice(0, 64))}`;
     status.textContent = "captured";
   } catch (err) {
@@ -102,6 +111,10 @@ captureButton.addEventListener("click", () => {
     status.textContent = "capture failed";
   }
 });
+
+function formatHexInline(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join(" ");
+}
 
 function formatHex(bytes: Uint8Array): string {
   const lines: string[] = [];
