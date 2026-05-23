@@ -251,10 +251,21 @@ Everything M12–M14 depends on "a back-channel exists" and doesn't care which m
 
 Do **M11a (visual)** first as the canonical reference implementation — keeps the project's philosophical purity intact and forces us to solve bidirectional optical alignment. Add **M11b (audio)** as a stretch milestone, primarily for demos where the spatial setup makes the visual back-channel impractical (e.g., two laptops at a meetup table).
 
+#### Audible-mode toggle (opt-in for quirk)
+
+Near-ultrasonic (17–20 kHz) is the right *default* for the audio back-channel — invisible to the ear, no interference with conversation, no startled bystanders. But there's a strong product argument for a toggle that **moves the FSK tones into the human-audible range** (say 1000–2000 Hz) on demand: it lets a person *witness* the back-channel in action. The whole point of the project is making computers communicate in ways humans can perceive — photons are already visible, the bytes-as-colours are right there. Letting the audio be audible by request is exactly the kind of quirk that fits the photophone metaphor.
+
+Concretely: a single toggle on the receiver page, off by default. When on, the FSK tone pair drops from `(f₀_ultra, f₁_ultra)` into `(f₀_audible, f₁_audible)`. Encoding and protocol are otherwise identical; only the carrier frequencies change. The user gets to *hear* the ACKs and NACKs flying between the two devices.
+
+Why this is worth shipping (when M11b lands):
+- Demos / meetups where the audible duet is the punchline.
+- Pedagogical value — teaches data-over-sound viscerally without anyone having to explain "this is real, just trust me, ultrasonic."
+- Debugging — audible tones tell you that the device IS emitting something even when detection isn't working.
+
 #### What we explicitly don't want
 
 - **Audio for the main data path.** That would dilute the project's identity.
-- **Annoying audio.** If we ship audible-frequency back-channel, it should be a polite beep when in use, not a continuous chirp. Default to near-ultrasonic if hardware supports it.
+- **Audible audio *as default*.** Audible mode is opt-in — it lights up because the user asked for it. Default is near-ultrasonic. A polite beep, never a continuous chirp.
 
 
 ## 7. Open questions
