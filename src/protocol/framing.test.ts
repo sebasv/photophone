@@ -13,6 +13,7 @@ import {
   decodeFrameWarped,
   detectFiducials,
   detectPDPs,
+  decodeFrameWarpedWithDiagnostics,
   fiducialCanonicalCentroids,
   type Homography,
   otsuThreshold,
@@ -458,3 +459,77 @@ function randomBytes(n: number, seed: number): Uint8Array {
   }
   return out;
 }
+
+
+describe("M4.5 decodeFrameWarpedWithDiagnostics", () => {
+  const cellSizePx = 8;
+
+  it("returns the same decode + a populated diagnostics struct on success", () => {
+    const dst: [Point, Point, Point, Point] = [
+      { x: 120, y: 110 },
+      { x: 660, y: 80 },
+      { x: 690, y: 620 },
+      { x: 90, y: 590 },
+    ];
+    const { warped, original } = renderWarped(dst);
+
+    const d = decodeFrameWarpedWithDiagnostics(
+      DEFAULT_GEOMETRY,
+      PALETTE_2BIT,
+      warped,
+      cellSizePx,
+    );
+
+    expect(d.failureReason).toBeNull();
+    expect(d.result).not.toBeNull();
+    expect(d.detection.otsuThreshold).toBeGreaterThanOrEqual(0);
+    expect(d.detection.chosen).not.toBeNull();
+    expect(d.detection.allCandidates.length).toBeGreaterThanOrEqual(4);
+    expect(d.rotationsAttempted.length).toBeGreaterThan(0);
+    const matchedRotations = d.rotationsAttempted.filter((r) => r.matched);
+    expect(matchedRotations.length).toBe(1);
+    expect(matchedRotations[0]!.rotation).toBe(d.result!.orientation);
+
+    // The decoded cells should still recover the original payload.
+    const trimmed = d.result!.cells.slice(0, bytesToCells(original, PALETTE_2BIT).length);
+    expect(cellsToBytes(trimmed, PALETTE_2BIT)).toEqual(original);
+  });
+
+  it("surfaces a failureReason and no result for an image with no PDPs", () => {
+    const img = solidImage(800, 600, 100);
+    const d = decodeFrameWarpedWithDiagnostics(
+      DEFAULT_GEOMETRY,
+      PALETTE_2BIT,
+      img,
+      cellSizePx,
+    );
+    expect(d.result).toBeNull();
+    expect(d.failureReason).toBeTruthy();
+    expect(d.detection.chosen).toBeNull();
+  });
+
+  it("records each rotation's sampled magic bytes when detection succeeds but no rotation matches", () => {
+    // Render a frame with garbage (no magic) and decode. PDPs will be found
+    // but no rotation will match the magic.
+    const cellSizePx2 = 8;
+    const capacity = payloadCellCount(DEFAULT_GEOMETRY);
+    const cells = new Uint8Array(capacity);
+    for (let i = 0; i < capacity; i++) cells[i] = (i * 3 + 7) & 0x3; // not PHOT
+    const pristine = renderFrame(DEFAULT_GEOMETRY, PALETTE_2BIT, cells, cellSizePx2);
+
+    const d = decodeFrameWarpedWithDiagnostics(
+      DEFAULT_GEOMETRY,
+      PALETTE_2BIT,
+      pristine,
+      cellSizePx2,
+    );
+    expect(d.result).toBeNull();
+    expect(d.detection.chosen).not.toBeNull();
+    expect(d.rotationsAttempted.length).toBe(4);
+    expect(d.rotationsAttempted.every((r) => !r.matched)).toBe(true);
+    // All four magic-byte samples should be 4 bytes long.
+    for (const attempt of d.rotationsAttempted) {
+      expect(attempt.magicBytes.length).toBe(4);
+    }
+  });
+});

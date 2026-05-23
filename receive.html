@@ -17,6 +17,10 @@
         <button id="start-camera">Start camera</button>
         <button id="capture-frame" disabled>Capture frame</button>
         <span id="status" class="status">idle</span>
+        <label class="diagnostics-toggle">
+          <input type="checkbox" id="diagnostics-toggle" />
+          <span>Show diagnostics</span>
+        </label>
       </section>
       <section class="stage">
         <video id="camera-video" playsinline autoplay muted></video>
@@ -26,6 +30,9 @@
       </section>
       <section class="output">
         <pre id="decoded-output">No capture yet.</pre>
+      </section>
+      <section class="output diagnostics-panel" id="diagnostics-panel" hidden>
+        <pre id="diagnostics-output"></pre>
       </section>
     </main>
     <script type="module" src="/src/pages/receive.ts"></script>

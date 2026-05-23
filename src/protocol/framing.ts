@@ -771,3 +771,149 @@ function sampleAllCells(
   }
   return out;
 }
+
+// =========================================================================
+// M4.5: diagnostic variants — return everything the detector / decoder saw
+// =========================================================================
+
+export interface FiducialDetectionDiagnostics {
+  /** Per-frame Otsu threshold, or -1 if the image was uniform. */
+  otsuThreshold: number;
+  /** All PDP candidates that passed the area-ratio + nested-bbox checks. */
+  allCandidates: PDPCandidate[];
+  /** The four chosen as closest-to-image-corner, or null if < 4 candidates. */
+  chosen: [Point, Point, Point, Point] | null;
+}
+
+export function detectFiducialsWithDiagnostics(
+  img: RawImage,
+): FiducialDetectionDiagnostics {
+  const t = otsuThreshold(img);
+  if (t < 0) return { otsuThreshold: t, allCandidates: [], chosen: null };
+  const allCandidates = detectPDPs(img, t);
+  const chosen = pickFourByImageCorner(allCandidates, img.width, img.height);
+  return { otsuThreshold: t, allCandidates, chosen };
+}
+
+/** One rotation that the decoder tried, with the four magic bytes it sampled. */
+export interface DecodeRotationAttempt {
+  rotation: number;
+  /** The 4 bytes sampled from the first 16 payload cells at this rotation. */
+  magicBytes: Uint8Array;
+  /** Whether those four bytes equalled the "PHOT" magic. */
+  matched: boolean;
+}
+
+export interface DecodeFrameWarpedDiagnostics {
+  detection: FiducialDetectionDiagnostics;
+  /** One entry per rotation tried (0..3), in order, stopping at the first match. */
+  rotationsAttempted: DecodeRotationAttempt[];
+  /** Decode output if any rotation matched; null otherwise. */
+  result: WarpedDecodeResult | null;
+  /** Short string describing the failure mode when result is null. */
+  failureReason: string | null;
+}
+
+/**
+ * Like `decodeFrameWarped`, but never throws and returns every intermediate
+ * the receiver UI / future overlay needs to surface the "why" of a failure.
+ */
+export function decodeFrameWarpedWithDiagnostics(
+  g: FrameGeometry,
+  palette: Palette,
+  img: RawImage,
+  cellSizePx: number,
+): DecodeFrameWarpedDiagnostics {
+  const detection = detectFiducialsWithDiagnostics(img);
+  const rotationsAttempted: DecodeRotationAttempt[] = [];
+
+  if (!detection.chosen) {
+    return {
+      detection,
+      rotationsAttempted,
+      result: null,
+      failureReason:
+        detection.allCandidates.length === 0
+          ? "no PDP candidates passed the area-ratio and nested-bbox tests"
+          : `only ${detection.allCandidates.length} PDPs detected, need 4`,
+    };
+  }
+
+  const canonical = fiducialCanonicalCentroids(g, cellSizePx);
+  const positions = payloadCellPositions(g);
+  const cellsPerByte = 8 / bitsPerCell(palette);
+  const magicCells = MAGIC.length * cellsPerByte;
+  if (positions.length < magicCells) {
+    return {
+      detection,
+      rotationsAttempted,
+      result: null,
+      failureReason: `payload region too small to carry the magic (${positions.length} < ${magicCells} cells)`,
+    };
+  }
+  const half = cellSizePx / 2;
+
+  for (let rotation = 0; rotation < 4; rotation++) {
+    const assigned = rotateAssignment(detection.chosen, rotation);
+    let h: Homography;
+    try {
+      h = computeHomography(canonical, assigned);
+    } catch {
+      rotationsAttempted.push({
+        rotation,
+        magicBytes: new Uint8Array(MAGIC.length),
+        matched: false,
+      });
+      continue;
+    }
+    const magicCellBuf = new Uint8Array(magicCells);
+    let outOfBounds = false;
+    for (let i = 0; i < magicCells; i++) {
+      const [cx, cy] = positions[i]!;
+      const warped = applyHomography(h, {
+        x: cx * cellSizePx + half,
+        y: cy * cellSizePx + half,
+      });
+      const px = Math.round(warped.x);
+      const py = Math.round(warped.y);
+      if (px < 0 || py < 0 || px >= img.width || py >= img.height) {
+        outOfBounds = true;
+        break;
+      }
+      magicCellBuf[i] = sampleNearestPalette(img, palette, px, py);
+    }
+    if (outOfBounds) {
+      rotationsAttempted.push({
+        rotation,
+        magicBytes: new Uint8Array(MAGIC.length),
+        matched: false,
+      });
+      continue;
+    }
+    const magicBytes = cellsToBytes(magicCellBuf, palette);
+    let matched = true;
+    for (let i = 0; i < MAGIC.length; i++) {
+      if (magicBytes[i] !== MAGIC[i]) {
+        matched = false;
+        break;
+      }
+    }
+    rotationsAttempted.push({ rotation, magicBytes, matched });
+    if (matched) {
+      const cells = sampleAllCells(img, palette, h, positions, cellSizePx, half);
+      return {
+        detection,
+        rotationsAttempted,
+        result: { cells, orientation: rotation, imageCornerCentroids: detection.chosen },
+        failureReason: null,
+      };
+    }
+  }
+
+  return {
+    detection,
+    rotationsAttempted,
+    result: null,
+    failureReason: "no rotation produced the expected magic — frame likely corrupted",
+  };
+}
