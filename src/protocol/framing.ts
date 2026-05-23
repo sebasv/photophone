@@ -532,6 +532,135 @@ export interface PDPCandidate {
  * tolerance is intentionally wide (0.6× to 4×) because partial pixels at
  * boundaries and bilinear smearing under warp distort the discrete counts.
  */
+/**
+ * Verify the 1:1:3:1:1 cross-section ratio through a candidate PDP centroid.
+ *
+ * Every real PDP has the same structural signature: a centred line through
+ * its 3×3 inner-black square, then the 1-cell white middle ring on each
+ * side, then the 1-cell outer black ring. So along any line through the
+ * centre — horizontal or vertical — the band widths form a 1:1:3:1:1
+ * ratio (`dark:light:dark:light:dark`).
+ *
+ * This is the structural property the flood-fill localiser tests by proxy
+ * (nested bbox + area ratio). The proxy lets some false positives through:
+ * a small UI shape with a dark blob inside a bright frame on a dark page
+ * can satisfy nested bbox + area ratio without actually having the
+ * 1:1:3:1:1 widths. The cross-section check rejects those decisively.
+ *
+ * Implementation walks from the centroid outward in four cardinal
+ * directions, counting consecutive pixels above/below the Otsu threshold.
+ * Each non-centre band must be in the tolerance range `[0.4, 2.0]` of
+ * the canonical "1 unit" (one third of the centre dark band's width).
+ * Tolerance is loose enough to absorb mild perspective warp; tight enough
+ * that arbitrary UI shapes don't pass.
+ *
+ * The outer dark band is only required to *reach* one canonical unit
+ * (no upper bound). Beyond the outer ring we re-enter sender-frame
+ * content of unpredictable colour — the walk's terminating condition
+ * is intentionally permissive to handle that.
+ */
+function verifyCrossSection(
+  img: RawImage,
+  centroid: Point,
+  threshold: number,
+): boolean {
+  const cx = Math.round(centroid.x);
+  const cy = Math.round(centroid.y);
+  if (cx < 0 || cy < 0 || cx >= img.width || cy >= img.height) return false;
+  if (luminance(img, cx, cy) > threshold) return false; // centre must be dark
+  return (
+    checkCrossAxis(img, cx, cy, threshold, 1, 0) &&
+    checkCrossAxis(img, cx, cy, threshold, 0, 1)
+  );
+}
+
+function checkCrossAxis(
+  img: RawImage,
+  cx: number,
+  cy: number,
+  threshold: number,
+  dx: number,
+  dy: number,
+): boolean {
+  // The four band widths along this axis, walking out from the centre.
+  const leftDark = countWhile(img, cx - dx, cy - dy, -dx, -dy, threshold, true);
+  const rightDark = countWhile(img, cx + dx, cy + dy, dx, dy, threshold, true);
+  const centerWidth = leftDark + 1 + rightDark;
+  if (centerWidth < 3) return false; // too small to be a meaningful PDP
+
+  const leftLightStartX = cx - (leftDark + 1) * dx;
+  const leftLightStartY = cy - (leftDark + 1) * dy;
+  const leftLight = countWhile(img, leftLightStartX, leftLightStartY, -dx, -dy, threshold, false);
+
+  const rightLightStartX = cx + (rightDark + 1) * dx;
+  const rightLightStartY = cy + (rightDark + 1) * dy;
+  const rightLight = countWhile(img, rightLightStartX, rightLightStartY, dx, dy, threshold, false);
+
+  // Cap the outer-dark walk at one centre width — beyond that we are well
+  // outside the PDP and surrounding cell content is unpredictable.
+  const outerCap = Math.ceil(centerWidth);
+  const leftOuter = countWhile(
+    img,
+    cx - (leftDark + 1 + leftLight) * dx,
+    cy - (leftDark + 1 + leftLight) * dy,
+    -dx,
+    -dy,
+    threshold,
+    true,
+    outerCap,
+  );
+  const rightOuter = countWhile(
+    img,
+    cx + (rightDark + 1 + rightLight) * dx,
+    cy + (rightDark + 1 + rightLight) * dy,
+    dx,
+    dy,
+    threshold,
+    true,
+    outerCap,
+  );
+
+  const unit = centerWidth / 3;
+  const tolLow = unit * 0.4;
+  const tolHigh = unit * 2.0;
+  // Light bands: must be within [low, high] of one unit.
+  if (leftLight < tolLow || leftLight > tolHigh) return false;
+  if (rightLight < tolLow || rightLight > tolHigh) return false;
+  // Outer dark bands: must reach at least one unit. No upper bound (dark
+  // surroundings beyond the PDP are normal).
+  if (leftOuter < tolLow) return false;
+  if (rightOuter < tolLow) return false;
+  return true;
+}
+
+/**
+ * Count consecutive pixels starting AT (sx, sy), walking in direction
+ * (dx, dy), for which `(luminance <= threshold) === wantDark`. Stops at
+ * the first mismatch, image boundary, or `cap` iterations (if provided).
+ */
+function countWhile(
+  img: RawImage,
+  sx: number,
+  sy: number,
+  dx: number,
+  dy: number,
+  threshold: number,
+  wantDark: boolean,
+  cap = Infinity,
+): number {
+  let count = 0;
+  let x = sx;
+  let y = sy;
+  while (count < cap && x >= 0 && y >= 0 && x < img.width && y < img.height) {
+    const isDark = luminance(img, x, y) <= threshold;
+    if (isDark !== wantDark) break;
+    count++;
+    x += dx;
+    y += dy;
+  }
+  return count;
+}
+
 export function detectPDPs(img: RawImage, threshold: number): PDPCandidate[] {
   const whites = findComponents(img, (x, y) => luminance(img, x, y) > threshold);
   const darks = findComponents(img, (x, y) => luminance(img, x, y) <= threshold);
@@ -555,6 +684,11 @@ export function detectPDPs(img: RawImage, threshold: number): PDPCandidate[] {
       // Area ratio sanity check.
       const ratio = white.pixelCount / dark.pixelCount;
       if (ratio < 0.6 || ratio > 4.0) continue;
+      // Final structural filter: 1:1:3:1:1 cross-section through the centroid.
+      // Rejects shapes that pass nested-bbox + area-ratio by coincidence
+      // (small letters, button-with-icon, reflections) but don't have the
+      // actual band-width signature.
+      if (!verifyCrossSection(img, dark.centroid, threshold)) continue;
       candidates.push({
         centroid: dark.centroid,
         whiteRingArea: white.pixelCount,
@@ -567,24 +701,215 @@ export function detectPDPs(img: RawImage, threshold: number): PDPCandidate[] {
 }
 
 /**
- * Pick the four PDPs closest to the image corners (one per corner). Returns
- * null if fewer than four candidates were supplied or some corner can't be
- * uniquely claimed.
+ * Pick the four PDPs that most plausibly represent the canvas's corner
+ * fiducials, then arrange them by image corner.
  *
- * The choice of "closest to image corner" is intentional: even with mid-image
- * false-positive PDP-like patches, the four real fiducials genuinely sit
- * nearest the four image corners.
+ * The earlier greedy "closest to each image corner" heuristic failed when
+ * a small UI element happened to sit closer to an image corner than the
+ * canvas's PDP (e.g. a "back" link near a laptop's top-left bezel). The
+ * detection layer correctly flagged the real PDPs as candidates, but the
+ * selector picked the false positive.
  *
- * Returned order: by image corner (top-left, top-right, bottom-right,
- * bottom-left) — *not* by sender-frame orientation. Orientation is recovered
- * later by trying all four rotational assignments against the magic.
+ * The fix uses two structural truths about the four real PDPs:
+ *
+ *   - **Mutual similarity.** The four real PDPs share the same render,
+ *     so under a mild perspective warp their pixel areas and area ratios
+ *     vary smoothly across the image — very low coefficient of variation
+ *     across the set. Random UI elements look nothing like each other.
+ *   - **Convex quadrilateral geometry.** The canvas is convex, so its
+ *     four PDP centroids form a convex quadrilateral. A subset that
+ *     mixes two real PDPs and two random false positives almost always
+ *     fails convexity (the false positives land "inside" the real
+ *     quad, causing self-intersection or reflex angles).
+ *
+ * Algorithm:
+ *   1. Rank candidates by area-ratio quality and take the top ~20 (caps
+ *      the C(n,4) combinatorial search).
+ *   2. Enumerate all 4-subsets. Reject any subset whose four centroids
+ *      do not form a convex quadrilateral.
+ *   3. Score the surviving subsets by 1 / (1 + areaCV + ratioCV), where
+ *      *CV* is the standard deviation divided by the mean. Pick the
+ *      highest-scoring subset.
+ *   4. Assign that subset's four points to TL / TR / BR / BL by Manhattan
+ *      distance to the image corners.
+ *
+ * C(20, 4) = 4845 subsets, each O(1) work — microseconds in practice.
  */
-function pickFourByImageCorner(
-  candidates: ReadonlyArray<{ centroid: Point }>,
+function pickFourPDPs(
+  candidates: ReadonlyArray<PDPCandidate>,
   imgW: number,
   imgH: number,
 ): [Point, Point, Point, Point] | null {
   if (candidates.length < 4) return null;
+  if (candidates.length === 4) {
+    // Skip the search; just assign.
+    return assignByImageCorner(
+      candidates.map((c) => c.centroid),
+      imgW,
+      imgH,
+    );
+  }
+
+  const cap = Math.min(candidates.length, 20);
+  const indices = rankByQuality(candidates).slice(0, cap);
+
+  let bestScore = -Infinity;
+  let bestPoints: Point[] | null = null;
+
+  for (let i = 0; i < indices.length - 3; i++) {
+    for (let j = i + 1; j < indices.length - 2; j++) {
+      for (let k = j + 1; k < indices.length - 1; k++) {
+        for (let l = k + 1; l < indices.length; l++) {
+          const subset = [
+            candidates[indices[i]!]!,
+            candidates[indices[j]!]!,
+            candidates[indices[k]!]!,
+            candidates[indices[l]!]!,
+          ];
+          const points = subset.map((c) => c.centroid);
+          if (!isConvexQuad(points)) continue;
+          const score = scoreSubset(subset, imgW, imgH);
+          if (score > bestScore) {
+            bestScore = score;
+            bestPoints = points;
+          }
+        }
+      }
+    }
+  }
+
+  if (!bestPoints) {
+    // No convex 4-subset; fall back to the closest-to-corner heuristic on
+    // the highest-quality four. Better to return *something* than nothing.
+    bestPoints = indices.slice(0, 4).map((idx) => candidates[idx]!.centroid);
+  }
+
+  return assignByImageCorner(bestPoints, imgW, imgH);
+}
+
+function rankByQuality(candidates: ReadonlyArray<PDPCandidate>): number[] {
+  const idealRatio = 16 / 9;
+  return candidates
+    .map((_, i) => i)
+    .sort((a, b) => {
+      const cA = candidates[a]!;
+      const cB = candidates[b]!;
+      const errA = Math.abs(cA.areaRatio - idealRatio);
+      const errB = Math.abs(cB.areaRatio - idealRatio);
+      if (errA !== errB) return errA - errB;
+      const areaA = cA.whiteRingArea + cA.blackCentreArea;
+      const areaB = cB.whiteRingArea + cB.blackCentreArea;
+      return areaB - areaA;
+    });
+}
+
+/**
+ * Score a candidate 4-subset by how plausibly it represents the canvas's
+ * four real PDPs. Combines two projection-stable signals and one
+ * positioning signal:
+ *
+ *   - **Area-ratio similarity (low CV).** A PDP's white-ring-to-dark-centre
+ *     area ratio is invariant under projective transforms, so the four real
+ *     PDPs always share it; spurious candidates have random ratios.
+ *   - **Corner proximity.** The four chosen points, once assigned to image
+ *     corners by Manhattan distance, should collectively sit *near* those
+ *     corners. A mid-image false positive will push its assigned corner's
+ *     distance up.
+ *
+ * Note: *area* similarity (not the ratio) is intentionally NOT used.
+ * Under strong perspective, the local Jacobian varies enough that the
+ * four real PDPs can differ in pixel area by 10× or more — a spurious
+ * candidate sitting in the middle of that distribution can have lower
+ * area variance than the real four. The ratio sidesteps this entirely.
+ */
+function scoreSubset(
+  subset: ReadonlyArray<PDPCandidate>,
+  imgW: number,
+  imgH: number,
+): number {
+  const ratios = subset.map((c) => c.areaRatio);
+  const ratioCV = coefficientOfVariation(ratios);
+
+  // Pixel area is a strong real-world signal: false positives (page text,
+  // UI buttons) are typically ~5-20× smaller than real PDPs, so a 4-subset
+  // mixing real and fake has very high areaCV. We weight area below ratio
+  // because under extreme synthetic perspective the four real PDPs can
+  // differ in area by 10× (large Jacobian variation), which would let a
+  // spurious mid-image candidate win on pure area similarity. The 0.5
+  // weight is large enough to dominate in realistic conditions while
+  // losing to ratio when perspective is severe.
+  const areas = subset.map((c) => c.whiteRingArea + c.blackCentreArea);
+  const areaCV = coefficientOfVariation(areas);
+
+  const points = subset.map((c) => c.centroid);
+  const assigned = assignByImageCorner(points, imgW, imgH);
+  if (!assigned) return -Infinity;
+  const corners: Point[] = [
+    { x: 0, y: 0 },
+    { x: imgW, y: 0 },
+    { x: imgW, y: imgH },
+    { x: 0, y: imgH },
+  ];
+  let totalCornerDist = 0;
+  for (let i = 0; i < 4; i++) {
+    totalCornerDist += Math.hypot(
+      assigned[i]!.x - corners[i]!.x,
+      assigned[i]!.y - corners[i]!.y,
+    );
+  }
+  const imgDiag = Math.hypot(imgW, imgH);
+  const normCornerDist = totalCornerDist / (imgDiag * 4); // 0..~1
+
+  return -ratioCV - 0.5 * areaCV - normCornerDist;
+}
+
+function coefficientOfVariation(values: ReadonlyArray<number>): number {
+  const n = values.length;
+  if (n === 0) return 0;
+  const mean = values.reduce((s, v) => s + v, 0) / n;
+  if (mean === 0) return Infinity;
+  const variance = values.reduce((s, v) => s + (v - mean) ** 2, 0) / n;
+  return Math.sqrt(variance) / mean;
+}
+
+/**
+ * Convexity test for four points: order them by angle around their centroid,
+ * then verify all four cross-products of consecutive edge pairs have the same
+ * sign. Robust to point ordering in the input.
+ */
+function isConvexQuad(pts: ReadonlyArray<Point>): boolean {
+  if (pts.length !== 4) return false;
+  const cx = (pts[0]!.x + pts[1]!.x + pts[2]!.x + pts[3]!.x) / 4;
+  const cy = (pts[0]!.y + pts[1]!.y + pts[2]!.y + pts[3]!.y) / 4;
+  const sorted = [...pts].sort(
+    (a, b) => Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx),
+  );
+  let sign = 0;
+  for (let i = 0; i < 4; i++) {
+    const a = sorted[i]!;
+    const b = sorted[(i + 1) % 4]!;
+    const c = sorted[(i + 2) % 4]!;
+    const cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+    if (cross === 0) continue;
+    const s = cross > 0 ? 1 : -1;
+    if (sign === 0) sign = s;
+    else if (s !== sign) return false;
+  }
+  return true;
+}
+
+/**
+ * Given four points, return them in image-corner order (TL, TR, BR, BL) by
+ * Manhattan distance to each image corner. Same algorithm the old greedy
+ * selector used, but operating only on the four already chosen by
+ * pickFourPDPs.
+ */
+function assignByImageCorner(
+  pts: ReadonlyArray<Point>,
+  imgW: number,
+  imgH: number,
+): [Point, Point, Point, Point] | null {
+  if (pts.length !== 4) return null;
   const corners: Point[] = [
     { x: 0, y: 0 },
     { x: imgW, y: 0 },
@@ -596,9 +921,9 @@ function pickFourByImageCorner(
   for (const corner of corners) {
     let bestIdx = -1;
     let bestDist = Infinity;
-    for (let i = 0; i < candidates.length; i++) {
+    for (let i = 0; i < pts.length; i++) {
       if (used.has(i)) continue;
-      const c = candidates[i]!.centroid;
+      const c = pts[i]!;
       const d = Math.abs(c.x - corner.x) + Math.abs(c.y - corner.y);
       if (d < bestDist) {
         bestDist = d;
@@ -607,7 +932,7 @@ function pickFourByImageCorner(
     }
     if (bestIdx === -1) return null;
     used.add(bestIdx);
-    picks.push(candidates[bestIdx]!.centroid);
+    picks.push(pts[bestIdx]!);
   }
   return [picks[0]!, picks[1]!, picks[2]!, picks[3]!];
 }
@@ -626,7 +951,7 @@ export function detectFiducials(
   const threshold = otsuThreshold(img);
   if (threshold < 0) return null;
   const pdps = detectPDPs(img, threshold);
-  return pickFourByImageCorner(pdps, img.width, img.height);
+  return pickFourPDPs(pdps, img.width, img.height);
 }
 
 // =========================================================================
@@ -791,7 +1116,7 @@ export function detectFiducialsWithDiagnostics(
   const t = otsuThreshold(img);
   if (t < 0) return { otsuThreshold: t, allCandidates: [], chosen: null };
   const allCandidates = detectPDPs(img, t);
-  const chosen = pickFourByImageCorner(allCandidates, img.width, img.height);
+  const chosen = pickFourPDPs(allCandidates, img.width, img.height);
   return { otsuThreshold: t, allCandidates, chosen };
 }
 
