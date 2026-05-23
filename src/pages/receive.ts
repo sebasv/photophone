@@ -273,7 +273,7 @@ function formatDiagnostics(d: DecodeFrameWarpedDiagnostics): string {
     }
     for (let i = 0; i < d.detection.allCandidates.length; i++) {
       const c = d.detection.allCandidates[i]!;
-      const role = chosenSet.has(i) ? "chosen" : "rejected (not closest to a corner)";
+      const role = chosenSet.has(i) ? "chosen" : "rejected (not in highest-scoring 4-subset)";
       lines.push(
         `  ${String(i).padStart(2)} (${c.centroid.x.toFixed(1).padStart(7)}, ${c.centroid.y.toFixed(1).padStart(7)}) ` +
           `${String(c.whiteRingArea + c.blackCentreArea).padStart(5)}  ${c.areaRatio.toFixed(2).padStart(5)}  ${role}`,

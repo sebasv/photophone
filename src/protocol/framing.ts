@@ -830,6 +830,17 @@ function scoreSubset(
   const ratios = subset.map((c) => c.areaRatio);
   const ratioCV = coefficientOfVariation(ratios);
 
+  // Pixel area is a strong real-world signal: false positives (page text,
+  // UI buttons) are typically ~5-20× smaller than real PDPs, so a 4-subset
+  // mixing real and fake has very high areaCV. We weight area below ratio
+  // because under extreme synthetic perspective the four real PDPs can
+  // differ in area by 10× (large Jacobian variation), which would let a
+  // spurious mid-image candidate win on pure area similarity. The 0.5
+  // weight is large enough to dominate in realistic conditions while
+  // losing to ratio when perspective is severe.
+  const areas = subset.map((c) => c.whiteRingArea + c.blackCentreArea);
+  const areaCV = coefficientOfVariation(areas);
+
   const points = subset.map((c) => c.centroid);
   const assigned = assignByImageCorner(points, imgW, imgH);
   if (!assigned) return -Infinity;
@@ -849,7 +860,7 @@ function scoreSubset(
   const imgDiag = Math.hypot(imgW, imgH);
   const normCornerDist = totalCornerDist / (imgDiag * 4); // 0..~1
 
-  return -ratioCV - normCornerDist;
+  return -ratioCV - 0.5 * areaCV - normCornerDist;
 }
 
 function coefficientOfVariation(values: ReadonlyArray<number>): number {
