@@ -18,10 +18,11 @@
           <input type="file" id="payload-input" accept="image/png" />
           <span>Choose a PNG to transmit</span>
         </label>
-        <button id="start-button" disabled>Start transmitting</button>
+        <button id="start-button" disabled>Render first frame</button>
+        <span id="status" class="status">idle</span>
       </section>
       <section class="stage">
-        <canvas id="frame-canvas" width="800" height="800"></canvas>
+        <canvas id="frame-canvas"></canvas>
       </section>
     </main>
     <script type="module" src="/src/pages/send.ts"></script>

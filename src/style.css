@@ -163,9 +163,61 @@ button:disabled {
 }
 
 #frame-canvas,
-#camera-video {
+#camera-video,
+#capture-preview {
   display: block;
   width: 100%;
   height: auto;
   max-height: 75vh;
+}
+
+.stage--secondary {
+  min-height: 0;
+}
+
+.stage--secondary #capture-preview {
+  max-height: 40vh;
+}
+
+.output {
+  background: #0c0c0c;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 1rem;
+  overflow-x: auto;
+}
+
+.output pre {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/*
+ * Camera-safe colour scope for the sender page.
+ *
+ * The receiver's fiducial detector classifies a pixel as a marker candidate
+ * when all three RGB channels exceed 200/255. The default --fg of #f5f5f5
+ * (245/245/245) passes that test on every channel, so any white letter on
+ * the sender page (the H1 "Send", button labels, status text) becomes a
+ * candidate fiducial cluster. With large enough glyphs, those clusters
+ * survive the size filter and win corner assignment over the actual
+ * fiducial markers, causing decode to fail.
+ *
+ * Restricting the send page to a colour with at least one channel < 200
+ * keeps text readable while making it impossible for UI text to ever pass
+ * the marker test. The accent yellow #f9c846 = (249, 200, 70) has B=70,
+ * comfortably below threshold even after camera ISP gain.
+ *
+ * Full structural rejection of arbitrary white shapes lands in M3.5; this
+ * is the cheap defence-in-depth until then.
+ */
+.page--send,
+.page--send button,
+.page--send .file-picker {
+  color: var(--accent);
 }

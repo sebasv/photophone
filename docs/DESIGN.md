@@ -242,11 +242,28 @@ A note on ordering: the forward-only unicast pipeline (M1–M8) is *almost* broa
 - **Done when:** the receiver decodes a frame that's been programmatically rotated, scaled, and perspective-warped (still synthetic, no camera) without errors.
 
 ### M3.5 — Orientation-invariant fiducials
-- Make the top-left fiducial's inner marker an **L-shape** (3 cells out of the 2×2 inner area), keeping the other three fiducials' inner markers as solid 2×2 squares. This breaks the rotational symmetry of the four corner markers.
-- In `detectFiducials`, compute each cluster's **fill ratio** (`pixelCount / bboxArea`). The cluster with the lowest fill ratio (~0.75 vs ~1.0) is the top-left. Order the remaining three by clockwise angle around the centroid of all four to recover TR / BR / BL.
+**Motivation — two problems discovered during M4 manual testing:**
+
+1. **Orientation.** `detectFiducials` assigns blobs to corners by Manhattan distance to *image* corners, which is rotation-blind: rotate the camera 180° and the receiver labels what was the sender's TL as BR, so cells decode back-to-front.
+
+2. **False positives.** Any white blob over the `>200`-on-all-three-channels marker threshold that survives the size filter is a candidate. White letters on the sender page (page title "Send", button labels, status text — all rendered in `#f5f5f5`) easily pass both, and when they sit closer to image corners than the actual fiducial markers they win the corner-assignment. The decoder then samples cells from wherever the misled homography lands — typically off-frame — and gets mostly zeros back. PR #8 ships a defence-in-depth (sender page text recoloured to a camera-safe palette), but the structural fix belongs here.
+
+Both problems are fixed by the same change: make the top-left fiducial **shape-distinctive** rather than just "the largest white blob in the top-left quadrant."
+
+**Why not just add a quiet zone (margin of black) around each fiducial?** Because letters on a dark page already have black around them; the surrounding margin is visually identical to a fiducial's outer ring. Whitespace separates content from noise but doesn't *characterise* fiducial-ness. The fix has to constrain shape, not surroundings.
+
+QR codes solve this with concentric finder patterns (1:1:3:1:1 black:white:black:white:black ratio across the middle of each PDP), which random objects essentially never match. Photophone uses the cheaper L-vs-square shape distinction — one bit of asymmetry on one corner — which gives us both orientation and structural rejection at no cost in payload area.
+
+**Approach:**
+
+- Make the top-left fiducial's inner marker an **L-shape** (3 cells out of the 2×2 inner area), keeping the other three fiducials' inner markers as solid 2×2 squares. This breaks the rotational symmetry of the four corner markers *and* adds a shape constraint that arbitrary white blobs do not satisfy.
+- In `detectFiducials`, compute each cluster's **fill ratio** (`pixelCount / bboxArea`). The cluster with the lowest fill ratio (~0.75) is the top-left. Require fill ratio ≈ 1.0 (within tolerance) for the other three — this is what rejects letters and other random white shapes whose bounding boxes are mostly empty space. Order the remaining three by clockwise angle around the centroid of all four to recover TR / BR / BL.
 - Fill ratio is a ratio of areas — projectively invariant — so the classification holds regardless of camera rotation, scale, or perspective.
 - A nice side effect: a human glancing at the rendered frame can tell at a glance which corner is "top-left", confirming the sender's intended orientation without a second device.
-- **Done when:** the same payload decodes correctly with the camera held at any of the four cardinal orientations (0°, 90° CW, 180°, 90° CCW). Verified with both synthetic-warp tests (rotated inputs to `decodeFrameWarped`) and the M4 manual capture loop.
+- **Done when:**
+  - The same payload decodes correctly with the camera held at any of the four cardinal orientations (0°, 90° CW, 180°, 90° CCW).
+  - White text and other arbitrary white shapes in the camera frame are rejected as candidates, even when they sit closer to image corners than the actual fiducials.
+  - Verified with both synthetic-warp tests (rotated inputs to `decodeFrameWarped`) and the M4 manual capture loop without manually obscuring sender-page UI.
 
 ### M4 — First camera capture
 - Receiver page: snap a still frame from `getUserMedia`, decode it.

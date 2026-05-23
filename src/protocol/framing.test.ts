@@ -12,6 +12,7 @@ import {
   decodeFrame,
   decodeFrameWarped,
   detectFiducials,
+  detectionBoundsForCellSize,
   fiducialCanonicalCentroids,
   type Homography,
   isFiducialMarkerCell,
@@ -145,7 +146,10 @@ describe("fiducial detection on a pristine frame", () => {
     const cells = new Uint8Array(payloadCellCount(DEFAULT_GEOMETRY));
     const img = renderFrame(DEFAULT_GEOMETRY, PALETTE_2BIT, cells, cellSizePx);
 
-    const detected = detectFiducials(img, cellSizePx * 2);
+    const detected = detectFiducials(
+      img,
+      detectionBoundsForCellSize(cellSizePx),
+    );
     expect(detected).not.toBeNull();
     const canonical = fiducialCanonicalCentroids(DEFAULT_GEOMETRY, cellSizePx);
 
