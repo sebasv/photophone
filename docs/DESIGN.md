@@ -349,7 +349,8 @@ After detection, verify the four chosen PDP centroids form a roughly-convex quad
 - Sender uses conservative defaults (larger cells, smallest palette, slow fps) because there's no negotiation.
 - New sender UI mode: "broadcast" — picks a file, shows a session info banner, loops fountain-encoded frames indefinitely.
 - Receivers can tune in at any time, no pairing.
-- **Done when:** open two receiver windows that start at different times during a single broadcast of `hello_world.png`; both reconstruct the file successfully without coordinating.
+- **This is also where Photophone formally becomes a *file* transfer rather than a *byte stream*** — the receiver reads the bootstrap mime/filename and saves the result with the correct name and extension, regardless of payload type (see §9.2).
+- **Done when:** open two receiver windows that start at different times during a single broadcast; both reconstruct the file successfully without coordinating, save it with the correct name and extension, and verify the sha256 transmitted in the bootstrap. Verified with at least two payload types (a PNG and a non-image binary, e.g. a small PDF or text file) to confirm the any-binary path.
 
 ### M11 — Receiver→sender back-channel (visual ACK channel)
 - Receiver page can render a small dedicated channel frame (lower fps, larger cells acceptable) on its own screen.
@@ -391,6 +392,47 @@ After detection, verify the four chosen PDP centroids form a roughly-convex quad
 - **No subpixel positioning.** Frame top-left snaps to integer pixels; cell pitch is an integer number of pixels.
 - **Cell sampling on receive.** After perspective unwarp the receiver samples a small NxN patch in the *centre* of each cell (e.g., the central 50% of the cell area) and averages, to avoid edge contamination.
 - **Palette colours** are picked to be maximally separated in the camera's likely operating space. Black + primary RGB is the cheap-and-cheerful 4-colour starting point; larger palettes will need empirical placement.
+
+## 9.2 Payload format and the move from PNG to any-binary
+
+The Photophone protocol layer (codec, framing, transport) is **binary-agnostic from the start** — it transports an opaque `Uint8Array` and never inspects its contents. The only places where PNG appears in the codebase are UX hints in the sender / receiver pages:
+
+- `send.html`'s file picker uses `accept="image/png"`
+- `receive.ts`'s success message checks the PNG file signature (`89 50 4E 47 0D 0A 1A 0A`) as a payload-content sanity hint
+- `hello_world.png` is the canonical end-to-end test corpus
+
+These are scaffolding around the M4 manual test loop; nothing in the wire format prevents transmitting any other binary.
+
+### Phased transition
+
+**Phase A — UX-level "any binary" (small, can land any time)**
+
+- Drop `accept="image/png"` (or set to `accept="*"`) on the file picker.
+- Replace the PNG-signature sanity check with a generic "received N bytes" display, ideally with light file-type sniffing (`89 50 4E 47…` = PNG, `FF D8 FF` = JPEG, `25 50 44 46` = PDF, etc.) so the receiver can still give a useful hint when it recognises the type.
+- No protocol changes. Existing `hello_world.png` tests continue to work.
+
+**Phase B — Self-describing payloads via bootstrap metadata (M10)**
+
+The bootstrap region (§4.1) already reserves space for `mime_index`, `filename_hash`, full sha256, and full filename. Once M10 lands these are populated by the sender on every frame, and the receiver can:
+
+- Save the received bytes with the correct filename and extension
+- Show the inferred MIME in the UI
+- Verify integrity against the transmitted sha256
+
+This is when Photophone formally becomes a *file* transfer rather than a *byte stream* — a real "send me that PDF" use case.
+
+### Recommended milestone allocation
+
+- **Phase A** as a small standalone PR alongside or after the next milestone. Removing the PNG-only UI hints is cheap and lets the project advertise itself as "any binary" sooner.
+- **Phase B** is **M10**'s headline. The broadcast mode is what makes "drop this file into the world" interesting, so the file-transfer UX naturally arrives with it.
+
+### Concretely — what changes when
+
+- M5 / M6 / M7 / M8: protocol work is binary-agnostic; payload type is a UX detail.
+- M9 (fountain coding): unchanged — fountain operates on bytes, not files.
+- M10 (broadcast mode): adds bootstrap-metadata-driven mime/filename. **The receiver becomes file-aware here.** Done-when should explicitly mention "two receivers can pick up a broadcast and save the file with the correct name and extension regardless of type."
+- M10+: payload type is no longer a meaningful protocol concept.
+
 
 ## 10. Out of scope (forever or until requested)
 
