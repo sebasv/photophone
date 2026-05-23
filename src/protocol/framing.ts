@@ -532,6 +532,135 @@ export interface PDPCandidate {
  * tolerance is intentionally wide (0.6× to 4×) because partial pixels at
  * boundaries and bilinear smearing under warp distort the discrete counts.
  */
+/**
+ * Verify the 1:1:3:1:1 cross-section ratio through a candidate PDP centroid.
+ *
+ * Every real PDP has the same structural signature: a centred line through
+ * its 3×3 inner-black square, then the 1-cell white middle ring on each
+ * side, then the 1-cell outer black ring. So along any line through the
+ * centre — horizontal or vertical — the band widths form a 1:1:3:1:1
+ * ratio (`dark:light:dark:light:dark`).
+ *
+ * This is the structural property the flood-fill localiser tests by proxy
+ * (nested bbox + area ratio). The proxy lets some false positives through:
+ * a small UI shape with a dark blob inside a bright frame on a dark page
+ * can satisfy nested bbox + area ratio without actually having the
+ * 1:1:3:1:1 widths. The cross-section check rejects those decisively.
+ *
+ * Implementation walks from the centroid outward in four cardinal
+ * directions, counting consecutive pixels above/below the Otsu threshold.
+ * Each non-centre band must be in the tolerance range `[0.4, 2.0]` of
+ * the canonical "1 unit" (one third of the centre dark band's width).
+ * Tolerance is loose enough to absorb mild perspective warp; tight enough
+ * that arbitrary UI shapes don't pass.
+ *
+ * The outer dark band is only required to *reach* one canonical unit
+ * (no upper bound). Beyond the outer ring we re-enter sender-frame
+ * content of unpredictable colour — the walk's terminating condition
+ * is intentionally permissive to handle that.
+ */
+function verifyCrossSection(
+  img: RawImage,
+  centroid: Point,
+  threshold: number,
+): boolean {
+  const cx = Math.round(centroid.x);
+  const cy = Math.round(centroid.y);
+  if (cx < 0 || cy < 0 || cx >= img.width || cy >= img.height) return false;
+  if (luminance(img, cx, cy) > threshold) return false; // centre must be dark
+  return (
+    checkCrossAxis(img, cx, cy, threshold, 1, 0) &&
+    checkCrossAxis(img, cx, cy, threshold, 0, 1)
+  );
+}
+
+function checkCrossAxis(
+  img: RawImage,
+  cx: number,
+  cy: number,
+  threshold: number,
+  dx: number,
+  dy: number,
+): boolean {
+  // The four band widths along this axis, walking out from the centre.
+  const leftDark = countWhile(img, cx - dx, cy - dy, -dx, -dy, threshold, true);
+  const rightDark = countWhile(img, cx + dx, cy + dy, dx, dy, threshold, true);
+  const centerWidth = leftDark + 1 + rightDark;
+  if (centerWidth < 3) return false; // too small to be a meaningful PDP
+
+  const leftLightStartX = cx - (leftDark + 1) * dx;
+  const leftLightStartY = cy - (leftDark + 1) * dy;
+  const leftLight = countWhile(img, leftLightStartX, leftLightStartY, -dx, -dy, threshold, false);
+
+  const rightLightStartX = cx + (rightDark + 1) * dx;
+  const rightLightStartY = cy + (rightDark + 1) * dy;
+  const rightLight = countWhile(img, rightLightStartX, rightLightStartY, dx, dy, threshold, false);
+
+  // Cap the outer-dark walk at one centre width — beyond that we are well
+  // outside the PDP and surrounding cell content is unpredictable.
+  const outerCap = Math.ceil(centerWidth);
+  const leftOuter = countWhile(
+    img,
+    cx - (leftDark + 1 + leftLight) * dx,
+    cy - (leftDark + 1 + leftLight) * dy,
+    -dx,
+    -dy,
+    threshold,
+    true,
+    outerCap,
+  );
+  const rightOuter = countWhile(
+    img,
+    cx + (rightDark + 1 + rightLight) * dx,
+    cy + (rightDark + 1 + rightLight) * dy,
+    dx,
+    dy,
+    threshold,
+    true,
+    outerCap,
+  );
+
+  const unit = centerWidth / 3;
+  const tolLow = unit * 0.4;
+  const tolHigh = unit * 2.0;
+  // Light bands: must be within [low, high] of one unit.
+  if (leftLight < tolLow || leftLight > tolHigh) return false;
+  if (rightLight < tolLow || rightLight > tolHigh) return false;
+  // Outer dark bands: must reach at least one unit. No upper bound (dark
+  // surroundings beyond the PDP are normal).
+  if (leftOuter < tolLow) return false;
+  if (rightOuter < tolLow) return false;
+  return true;
+}
+
+/**
+ * Count consecutive pixels starting AT (sx, sy), walking in direction
+ * (dx, dy), for which `(luminance <= threshold) === wantDark`. Stops at
+ * the first mismatch, image boundary, or `cap` iterations (if provided).
+ */
+function countWhile(
+  img: RawImage,
+  sx: number,
+  sy: number,
+  dx: number,
+  dy: number,
+  threshold: number,
+  wantDark: boolean,
+  cap = Infinity,
+): number {
+  let count = 0;
+  let x = sx;
+  let y = sy;
+  while (count < cap && x >= 0 && y >= 0 && x < img.width && y < img.height) {
+    const isDark = luminance(img, x, y) <= threshold;
+    if (isDark !== wantDark) break;
+    count++;
+    x += dx;
+    y += dy;
+  }
+  return count;
+}
+
 export function detectPDPs(img: RawImage, threshold: number): PDPCandidate[] {
   const whites = findComponents(img, (x, y) => luminance(img, x, y) > threshold);
   const darks = findComponents(img, (x, y) => luminance(img, x, y) <= threshold);
@@ -555,6 +684,11 @@ export function detectPDPs(img: RawImage, threshold: number): PDPCandidate[] {
       // Area ratio sanity check.
       const ratio = white.pixelCount / dark.pixelCount;
       if (ratio < 0.6 || ratio > 4.0) continue;
+      // Final structural filter: 1:1:3:1:1 cross-section through the centroid.
+      // Rejects shapes that pass nested-bbox + area-ratio by coincidence
+      // (small letters, button-with-icon, reflections) but don't have the
+      // actual band-width signature.
+      if (!verifyCrossSection(img, dark.centroid, threshold)) continue;
       candidates.push({
         centroid: dark.centroid,
         whiteRingArea: white.pixelCount,
