@@ -394,6 +394,85 @@ function paintFakePDP(
   }
 }
 
+describe("M5 done-when: decode under simulated lighting shifts", () => {
+  const cellSizePx = 8;
+  // A mild perspective warp shared across all the lighting shifts below.
+  const dst: [Point, Point, Point, Point] = [
+    { x: 120, y: 110 },
+    { x: 660, y: 80 },
+    { x: 690, y: 620 },
+    { x: 90, y: 590 },
+  ];
+
+  it.each([
+    {
+      name: "warm light (R↑, B↓) — would break a static-palette classifier",
+      // Reduces blue channel enough that palette[3] = (0, 0, 255) lands at
+      // (0, 0, 102) in the camera image — closer to (0, 0, 0) than (0, 0, 255).
+      // Without M5 the magic check would fail (the magic has blue cells).
+      shift: { rMul: 1.0, rBias: 0, gMul: 1.0, gBias: 0, bMul: 0.4, bBias: 0 },
+    },
+    {
+      name: "cool light (B↑, R↓)",
+      shift: { rMul: 0.6, rBias: 20, gMul: 1.0, gBias: 0, bMul: 1.0, bBias: 0 },
+    },
+    {
+      name: "dim mixed light (all channels reduced + slight per-channel bias)",
+      shift: { rMul: 0.55, rBias: 10, gMul: 0.6, gBias: 5, bMul: 0.5, bBias: 8 },
+    },
+  ])("$name", ({ shift }) => {
+    const { warped, original } = renderWarped(dst);
+    applyColourShift(warped, shift);
+
+    const result = decodeFrameWarped(
+      DEFAULT_GEOMETRY,
+      PALETTE_2BIT,
+      warped,
+      cellSizePx,
+    );
+    expect(result.orientation).toBe(0);
+    expect(result.learnedPalette.colors.length).toBe(PALETTE_2BIT.colors.length);
+    const trimmed = result.cells.slice(0, bytesToCells(original, PALETTE_2BIT).length);
+    expect(cellsToBytes(trimmed, PALETTE_2BIT)).toEqual(original);
+  });
+
+  it("surfaces the learned palette in WarpedDecodeResult so the receiver UI can show it", () => {
+    const { warped } = renderWarped(dst);
+    applyColourShift(warped, { rMul: 1.0, rBias: 0, gMul: 1.0, gBias: 0, bMul: 0.4, bBias: 0 });
+    const result = decodeFrameWarped(
+      DEFAULT_GEOMETRY,
+      PALETTE_2BIT,
+      warped,
+      cellSizePx,
+    );
+    // Learned palette's blue should be the shifted blue (~0, ~0, ~102),
+    // dramatically different from the canonical (0, 0, 255).
+    const learnedBlue = result.learnedPalette.colors[3]!;
+    expect(learnedBlue[2]).toBeLessThan(150); // canonical was 255, observed should be ~102
+    expect(learnedBlue[0]).toBeLessThan(40); // R stays near 0
+    expect(learnedBlue[1]).toBeLessThan(40); // G stays near 0
+  });
+});
+
+/**
+ * Apply a per-channel linear colour transform to an image in place. Used
+ * by M5 tests to simulate lighting conditions a camera would impose.
+ *   newR = clamp(rMul * R + rBias, 0..255)  (and same for G, B)
+ */
+function applyColourShift(
+  img: RawImage,
+  shift: { rMul: number; rBias: number; gMul: number; gBias: number; bMul: number; bBias: number },
+): void {
+  for (let i = 0; i < img.data.length; i += 4) {
+    const r = img.data[i]! * shift.rMul + shift.rBias;
+    const g = img.data[i + 1]! * shift.gMul + shift.gBias;
+    const b = img.data[i + 2]! * shift.bMul + shift.bBias;
+    img.data[i] = Math.max(0, Math.min(255, Math.round(r)));
+    img.data[i + 1] = Math.max(0, Math.min(255, Math.round(g)));
+    img.data[i + 2] = Math.max(0, Math.min(255, Math.round(b)));
+  }
+}
+
 // -------------------------------------------------------------------------
 // Helpers
 // -------------------------------------------------------------------------
