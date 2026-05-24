@@ -32,6 +32,7 @@ const previewCanvas = document.querySelector<HTMLCanvasElement>("#capture-previe
 const diagnosticsToggle = document.querySelector<HTMLInputElement>("#diagnostics-toggle")!;
 const diagnosticsPanel = document.querySelector<HTMLElement>("#diagnostics-panel")!;
 const diagnosticsOutput = document.querySelector<HTMLPreElement>("#diagnostics-output")!;
+const paletteSwatchCanvas = document.querySelector<HTMLCanvasElement>("#palette-swatches")!;
 
 // Hold the last successful capture so toggling diagnostics on/off can
 // re-render the overlay without re-capturing.
@@ -142,6 +143,12 @@ function renderCapture(capture: LastCapture): void {
   if (diagnosticsToggle.checked) {
     drawOverlay(previewCtx, diagnostics);
     diagnosticsOutput.textContent = formatDiagnostics(diagnostics);
+    if (diagnostics.result) {
+      drawPaletteSwatches(diagnostics.result.learnedPalette);
+      paletteSwatchCanvas.hidden = false;
+    } else {
+      paletteSwatchCanvas.hidden = true;
+    }
   }
 
   renderOutputText(diagnostics);
@@ -294,11 +301,87 @@ function formatDiagnostics(d: DecodeFrameWarpedDiagnostics): string {
       );
     }
   }
+  if (d.result) {
+    lines.push("");
+    lines.push("=== Learned palette (M5) ===");
+    const canonical = PALETTE_2BIT.colors;
+    for (let i = 0; i < d.result.learnedPalette.colors.length; i++) {
+      const [lr, lg, lb] = d.result.learnedPalette.colors[i]!;
+      const [cr, cg, cb] = canonical[i] ?? [0, 0, 0];
+      const dr = Math.round(lr) - cr;
+      const dg = Math.round(lg) - cg;
+      const db = Math.round(lb) - cb;
+      lines.push(
+        `  palette[${i}] canonical (${pad3(cr)}, ${pad3(cg)}, ${pad3(cb)})` +
+          `  →  learned (${pad3(Math.round(lr))}, ${pad3(Math.round(lg))}, ${pad3(Math.round(lb))})` +
+          `  Δ (${signed(dr)}, ${signed(dg)}, ${signed(db)})`,
+      );
+    }
+  }
   if (d.failureReason) {
     lines.push("");
     lines.push(`Failure reason: ${d.failureReason}`);
   }
   return lines.join("\n");
+}
+
+function pad3(n: number): string {
+  return String(n).padStart(3, " ");
+}
+function signed(n: number): string {
+  const sign = n >= 0 ? "+" : "-";
+  return `${sign}${pad3(Math.abs(n))}`;
+}
+
+/**
+ * Draw two rows of palette swatches into the diagnostics-panel canvas:
+ *   top row = canonical RGB the sender renders,
+ *   bottom row = observed RGB the receiver learned from this frame's
+ *   calibration strip.
+ *
+ * Visual side-by-side makes "this colour got pulled down by white balance"
+ * obvious in a way the text RGB triplets don't.
+ */
+function drawPaletteSwatches(learned: { colors: ReadonlyArray<readonly [number, number, number]> }): void {
+  const canvas = paletteSwatchCanvas;
+  const ctx = canvas.getContext("2d")!;
+  const swatchSize = 56;
+  const padding = 6;
+  const labelWidth = 84;
+  const numColors = learned.colors.length;
+  canvas.width = labelWidth + numColors * (swatchSize + padding);
+  canvas.height = 2 * swatchSize + padding;
+  ctx.fillStyle = "#0a0a0a";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Swatches
+  for (let i = 0; i < numColors; i++) {
+    const x = labelWidth + i * (swatchSize + padding);
+    const [cr, cg, cb] = PALETTE_2BIT.colors[i]!;
+    ctx.fillStyle = `rgb(${cr}, ${cg}, ${cb})`;
+    ctx.fillRect(x, 0, swatchSize, swatchSize);
+    const [lr, lg, lb] = learned.colors[i]!;
+    ctx.fillStyle = `rgb(${Math.round(lr)}, ${Math.round(lg)}, ${Math.round(lb)})`;
+    ctx.fillRect(x, swatchSize + padding, swatchSize, swatchSize);
+  }
+
+  // Labels
+  ctx.fillStyle = "#bbb";
+  ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, monospace";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText("canonical", 6, swatchSize / 2);
+  ctx.fillText("learned", 6, swatchSize + padding + swatchSize / 2);
+
+  // Index labels under each swatch column
+  ctx.fillStyle = "#666";
+  ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  for (let i = 0; i < numColors; i++) {
+    const x = labelWidth + i * (swatchSize + padding) + swatchSize / 2;
+    ctx.fillText(`#${i}`, x, 2);
+  }
 }
 
 function formatHexInline(bytes: Uint8Array): string {

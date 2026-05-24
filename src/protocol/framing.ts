@@ -986,6 +986,8 @@ export interface WarpedDecodeResult {
   orientation: number;
   /** Detected PDP centroids in image-corner order (pre-orientation). */
   imageCornerCentroids: [Point, Point, Point, Point];
+  /** M5: per-frame palette learned from the calibration strip — same length as the canonical palette, with the *observed* RGB per index under this frame's lighting. */
+  learnedPalette: Palette;
 }
 
 /**
@@ -1028,12 +1030,16 @@ export function decodeFrameWarped(
     } catch {
       continue; // singular system for this rotation — try the next
     }
-    if (!magicMatches(g, palette, img, h, positions, magicCells, cellSizePx, half)) {
+    // M5: learn the per-frame palette from the calibration strip before
+    // classifying cells. Has to be inside the rotation loop because the
+    // homography (and therefore the calibration cell positions) differs
+    // per rotation.
+    const learnedPalette = learnPaletteFromCalibration(g, palette, img, h, cellSizePx);
+    if (!magicMatches(g, learnedPalette, img, h, positions, magicCells, cellSizePx, half)) {
       continue;
     }
-    // Orientation found. Decode the full payload.
-    const cells = sampleAllCells(img, palette, h, positions, cellSizePx, half);
-    return { cells, orientation: rotation, imageCornerCentroids: imageCorners };
+    const cells = sampleAllCells(img, learnedPalette, h, positions, cellSizePx, half);
+    return { cells, orientation: rotation, imageCornerCentroids: imageCorners, learnedPalette };
   }
 
   throw new Error(
@@ -1095,6 +1101,76 @@ function sampleAllCells(
     out[i] = sampleNearestPalette(img, palette, px, py);
   }
   return out;
+}
+
+// =========================================================================
+// M5: per-frame palette calibration
+// =========================================================================
+
+/**
+ * Build a per-frame palette by sampling the calibration strip and using
+ * each observed cell's RGB as the "live" colour for the palette index it
+ * was rendered with.
+ *
+ * Why: the canonical palette `(0,0,0), (255,0,0), (0,255,0), (0,0,255)` is
+ * what the sender renders, but the camera reports the same cells with
+ * arbitrary tint, gain, and gamma based on the lighting it was metered
+ * against. Under warm light blue cells come back like `(0,0,102)` — close
+ * enough to black under the canonical palette that a static
+ * nearest-palette classifier mis-labels them. The calibration strip lets
+ * us learn the actual observed colour for each palette index on this
+ * specific frame and classify payload cells against that.
+ *
+ * The strip has many cells per palette index (rows `calibrationRowStart`
+ * to `calibrationRowStart + calibrationHeight`, all columns), each
+ * rendered as `palette[cx % palette.length]`. We average the observed
+ * RGB across all such cells per index.
+ */
+function learnPaletteFromCalibration(
+  g: FrameGeometry,
+  palette: Palette,
+  img: RawImage,
+  h: Homography,
+  cellSizePx: number,
+): Palette {
+  const n = palette.colors.length;
+  const sums = Array.from({ length: n }, () => ({ r: 0, g: 0, b: 0, count: 0 }));
+  const half = cellSizePx / 2;
+  for (let cy = g.calibrationRowStart; cy < g.calibrationRowStart + g.calibrationHeight; cy++) {
+    for (let cx = 0; cx < g.cellsX; cx++) {
+      const idx = cx % n;
+      const warped = applyHomography(h, {
+        x: cx * cellSizePx + half,
+        y: cy * cellSizePx + half,
+      });
+      const px = Math.round(warped.x);
+      const py = Math.round(warped.y);
+      if (px < 0 || py < 0 || px >= img.width || py >= img.height) continue;
+      const o = (py * img.width + px) * 4;
+      const bucket = sums[idx]!;
+      bucket.r += img.data[o]!;
+      bucket.g += img.data[o + 1]!;
+      bucket.b += img.data[o + 2]!;
+      bucket.count++;
+    }
+  }
+  const learned: [number, number, number][] = [];
+  for (let i = 0; i < n; i++) {
+    const bucket = sums[i]!;
+    if (bucket.count === 0) {
+      // Fall back to canonical colour when we couldn't sample (shouldn't
+      // happen for a well-aligned frame; defensive).
+      const [r, g, b] = palette.colors[i]!;
+      learned.push([r, g, b]);
+    } else {
+      learned.push([
+        bucket.r / bucket.count,
+        bucket.g / bucket.count,
+        bucket.b / bucket.count,
+      ]);
+    }
+  }
+  return { colors: learned };
 }
 
 // =========================================================================
@@ -1191,6 +1267,8 @@ export function decodeFrameWarpedWithDiagnostics(
       });
       continue;
     }
+    // M5: per-rotation learned palette.
+    const learnedPalette = learnPaletteFromCalibration(g, palette, img, h, cellSizePx);
     const magicCellBuf = new Uint8Array(magicCells);
     let outOfBounds = false;
     for (let i = 0; i < magicCells; i++) {
@@ -1205,7 +1283,7 @@ export function decodeFrameWarpedWithDiagnostics(
         outOfBounds = true;
         break;
       }
-      magicCellBuf[i] = sampleNearestPalette(img, palette, px, py);
+      magicCellBuf[i] = sampleNearestPalette(img, learnedPalette, px, py);
     }
     if (outOfBounds) {
       rotationsAttempted.push({
@@ -1225,11 +1303,16 @@ export function decodeFrameWarpedWithDiagnostics(
     }
     rotationsAttempted.push({ rotation, magicBytes, matched });
     if (matched) {
-      const cells = sampleAllCells(img, palette, h, positions, cellSizePx, half);
+      const cells = sampleAllCells(img, learnedPalette, h, positions, cellSizePx, half);
       return {
         detection,
         rotationsAttempted,
-        result: { cells, orientation: rotation, imageCornerCentroids: detection.chosen },
+        result: {
+          cells,
+          orientation: rotation,
+          imageCornerCentroids: detection.chosen,
+          learnedPalette,
+        },
         failureReason: null,
       };
     }
