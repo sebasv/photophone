@@ -75,6 +75,12 @@ export function deriveSourceIndices(
  * clamped to the actual returned index count (which may be less than the
  * requested degree if K is small or PRNG collisions reduce it).
  */
+/** 24-bit mask for the on-wire seed. Anything beyond bits 0-23 is silently
+ *  dropped by serializeEncoded, so the encoder must use the SAME truncated
+ *  value when deriving source indices — otherwise the receiver re-derives a
+ *  different set and decoding silently produces garbage. */
+const SEED_MASK = 0xffffff;
+
 export function encodeOnePacket(
   sourcePackets: ReadonlyArray<Uint8Array>,
   degree: number,
@@ -88,7 +94,8 @@ export function encodeOnePacket(
       throw new Error("encodeOnePacket: all source packets must have the same length");
     }
   }
-  const indices = deriveSourceIndices(seed, degree, K);
+  const wireSeed = (seed >>> 0) & SEED_MASK;
+  const indices = deriveSourceIndices(wireSeed, degree, K);
   if (indices.length === 0) {
     throw new Error("encodeOnePacket: derived zero source indices");
   }
@@ -97,7 +104,7 @@ export function encodeOnePacket(
     const src = sourcePackets[idx]!;
     for (let i = 0; i < S; i++) xor[i] = xor[i]! ^ src[i]!;
   }
-  return { degree: indices.length, seed, xorPayload: xor };
+  return { degree: indices.length, seed: wireSeed, xorPayload: xor };
 }
 
 /** Serialise an encoded packet to wire bytes (header + payload). */

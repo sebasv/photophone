@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0a0a0a" />
+    <title>Photophone · Broadcast receive</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <main class="page page--receive">
+      <header class="page__header">
+        <a href="/" class="back">← back</a>
+        <h1>Broadcast receive</h1>
+      </header>
+      <section class="controls">
+        <button id="start-camera">Start camera</button>
+        <button id="stream-button" disabled>Start receiving</button>
+        <button id="save-button" disabled>Save file</button>
+        <span id="status" class="status">idle</span>
+      </section>
+      <section class="output progress">
+        <pre id="progress-output"></pre>
+      </section>
+      <section class="stage">
+        <video id="camera-video" playsinline autoplay muted></video>
+      </section>
+      <section class="stage stage--secondary">
+        <canvas id="capture-preview"></canvas>
+      </section>
+      <section class="output">
+        <pre id="decoded-output">No frames decoded yet.</pre>
+      </section>
+    </main>
+    <script type="module" src="/src/pages/broadcast-receive.ts"></script>
+  </body>
+</html>
