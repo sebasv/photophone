@@ -10,9 +10,11 @@ import {
   PALETTE_2BIT,
   cellsToBytes,
   decodeBackChannelFrame,
+  decodeCapabilities,
   decodeFrameWarpedWithDiagnostics,
   decodeHello,
   payloadCellCount,
+  pickCellSizeFromCapabilities,
   rsDecodeAll,
   type SessionInfo,
 } from "../protocol";
@@ -131,9 +133,23 @@ function decodeOnce(): void {
       lastDecodedAt = performance.now();
       messagesDecoded++;
       const atMs = Math.round(lastDecodedAt - firstCaptureAt);
-      messages.push({ atMs, text, seq: parsed.seq });
+      messages.push({ atMs, text: `hello: "${text}"`, seq: parsed.seq });
       renderLog();
-      status.textContent = `decoded "${text}" at +${atMs} ms (msg ${messagesDecoded})`;
+      status.textContent = `decoded hello "${text}" at +${atMs} ms`;
+    } else if (parsed.msg.type === BackChannelMessageType.Capabilities) {
+      const cap = decodeCapabilities(parsed.msg);
+      if (cap) {
+        const cellSizePicked = pickCellSizeFromCapabilities(cap);
+        lastDecodedAt = performance.now();
+        messagesDecoded++;
+        const atMs = Math.round(lastDecodedAt - firstCaptureAt);
+        const summary =
+          `caps: cell ${cap.minCellSizePx}-${cap.maxCellSizePx}px (would pick ${cellSizePicked}px), ` +
+          `fps≤${cap.preferredFps}, grid ${cap.preferredCellsX}×${cap.preferredCellsY}, nsym ${cap.rsNsymTier}`;
+        messages.push({ atMs, text: summary, seq: parsed.seq });
+        renderLog();
+        status.textContent = `negotiated cell size ${cellSizePicked}px at +${atMs} ms`;
+      }
     }
     return;
   }

@@ -43,3 +43,47 @@ describe("back-channel frame round-trip", () => {
     expect(parsed).toBeNull();
   });
 });
+
+
+import {
+  CAPABILITIES_BODY_SIZE,
+  decodeCapabilities,
+  encodeCapabilities,
+  pickCellSizeFromCapabilities,
+  type Capabilities,
+} from "./backchannel";
+
+describe("M12 Capabilities", () => {
+  const BASE: Capabilities = {
+    maxCellSizePx: 20, minCellSizePx: 6, paletteId: 1, preferredFps: 15,
+    preferredCellsX: 64, preferredCellsY: 64, rsNsymTier: 32,
+  };
+  it("encode/decode round-trip", () => {
+    const m = encodeCapabilities(BASE);
+    expect(m.body.length).toBe(CAPABILITIES_BODY_SIZE);
+    const decoded = decodeCapabilities(m);
+    expect(decoded).toEqual(BASE);
+  });
+  it("rejects non-Capabilities messages", () => {
+    expect(decodeCapabilities({ type: BackChannelMessageType.Hello, body: new Uint8Array(12) })).toBeNull();
+  });
+  it("rejects short bodies", () => {
+    expect(decodeCapabilities({ type: BackChannelMessageType.Capabilities, body: new Uint8Array(8) })).toBeNull();
+  });
+  it("pickCellSizeFromCapabilities returns a value in [min, max]", () => {
+    for (const c of [
+      { ...BASE, minCellSizePx: 4, maxCellSizePx: 20 },
+      { ...BASE, minCellSizePx: 8, maxCellSizePx: 16 },
+      { ...BASE, minCellSizePx: 10, maxCellSizePx: 10 },
+    ]) {
+      const picked = pickCellSizeFromCapabilities(c);
+      expect(picked).toBeGreaterThanOrEqual(c.minCellSizePx);
+      expect(picked).toBeLessThanOrEqual(c.maxCellSizePx);
+    }
+  });
+  it("close-range advertising prefers smaller cells than long-range", () => {
+    const close = pickCellSizeFromCapabilities({ ...BASE, minCellSizePx: 4, maxCellSizePx: 10 });
+    const far = pickCellSizeFromCapabilities({ ...BASE, minCellSizePx: 16, maxCellSizePx: 28 });
+    expect(close).toBeLessThan(far);
+  });
+});

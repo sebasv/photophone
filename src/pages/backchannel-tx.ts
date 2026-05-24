@@ -9,10 +9,12 @@ import {
   PALETTE_2BIT,
   bytesToCells,
   encodeBackChannelFrame,
+  encodeCapabilities,
   encodeHello,
   payloadCellCount,
   renderFrame,
   rsEncode,
+  type Capabilities,
   type SessionInfo,
 } from "../protocol";
 
@@ -65,8 +67,24 @@ loopButton.addEventListener("click", () => {
 });
 
 function renderMessage(): void {
-  const text = messageInput.value || "hello back";
-  const msg = encodeHello(text);
+  const mode = (document.querySelector<HTMLSelectElement>("#bc-mode")?.value ?? "hello") as "hello" | "capabilities";
+  let label: string;
+  let msg;
+  if (mode === "capabilities") {
+    const minCell = Number((document.querySelector<HTMLInputElement>("#bc-min-cell")?.value ?? "8") || 8);
+    const maxCell = Number((document.querySelector<HTMLInputElement>("#bc-max-cell")?.value ?? "16") || 16);
+    const fps = Number((document.querySelector<HTMLInputElement>("#bc-fps")?.value ?? "15") || 15);
+    const cap: Capabilities = {
+      maxCellSizePx: maxCell, minCellSizePx: minCell, paletteId: 1,
+      preferredFps: fps, preferredCellsX: 64, preferredCellsY: 64, rsNsymTier: 32,
+    };
+    msg = encodeCapabilities(cap);
+    label = `capabilities (min=${minCell}px, max=${maxCell}px, fps=${fps})`;
+  } else {
+    const text = messageInput.value || "hello back";
+    msg = encodeHello(text);
+    label = `hello "${text}"`;
+  }
   const wire = encodeBackChannelFrame(msg, SESSION, seq);
   seq++;
   const ecc = rsEncode(wire, NSYM);
@@ -83,5 +101,5 @@ function renderMessage(): void {
   const out = ctx.createImageData(img.width, img.height);
   out.data.set(img.data);
   ctx.putImageData(out, 0, 0);
-  status.textContent = `frame #${seq} rendered (${text.length} char${text.length === 1 ? "" : "s"})`;
+  status.textContent = `frame #${seq} — ${label}`;
 }
