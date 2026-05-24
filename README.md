@@ -83,6 +83,17 @@ src/
     └── decoder.worker.ts   # off-main-thread decode pipeline
 ```
 
+## Limits
+
+A few hard and practical bounds worth knowing up-front:
+
+- **Maximum unicast payload — 4 GB** (hard). The packet header uses a u32 byte offset.
+- **Maximum broadcast payload — ~45 MB** (practical). Bootstrap metadata carries the source-packet count as a u16, giving ~65 535 source packets × ~700 B each. At 120 fps that's ~9 minutes of continuous one-pass broadcast — plenty for ad-hoc demos.
+- **Memory — O(payload size) at the receiver.** Unicast reassembly pre-allocates the full payload buffer; the fountain decoder holds up to K source packets until peeling finishes. Streaming-to-disk decoding is a deferred optimisation.
+- **Throughput** — per-frame byte capacity × camera fps. With defaults that's roughly 18 kB/s at 30 fps, 36 kB/s at 60 fps. `hello_world.png` (26 KB) is ≲ 2 s of clean broadcast at 60 fps.
+
+See [`docs/DESIGN.md` §9.3](./docs/DESIGN.md) for the derivation and deferred refinements.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
