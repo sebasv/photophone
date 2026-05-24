@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0a0a0a" />
+    <title>Photophone · Audio back-channel receive</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <main class="page page--receive">
+      <header class="page__header">
+        <a href="/" class="back">← back</a>
+        <h1>Audio back-channel (receive)</h1>
+      </header>
+      <p class="tagline">M11b standalone test page. Captures the microphone, polls Goertzel filters at each bit period, looks for the FSK preamble and frame.</p>
+      <section class="controls">
+        <button id="start-mic">Start mic</button>
+        <span id="status" class="status">idle</span>
+      </section>
+      <section class="output">
+        <pre id="bc-log">No messages decoded yet.</pre>
+      </section>
+    </main>
+    <script type="module" src="/src/pages/audio-bc-rx.ts"></script>
+  </body>
+</html>

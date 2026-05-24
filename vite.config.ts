@@ -30,6 +30,8 @@ export default defineConfig({
         "broadcast-receive": resolve(__dirname, "broadcast-receive.html"),
         "backchannel-tx": resolve(__dirname, "backchannel-tx.html"),
         "backchannel-rx": resolve(__dirname, "backchannel-rx.html"),
+        "audio-bc-tx": resolve(__dirname, "audio-bc-tx.html"),
+        "audio-bc-rx": resolve(__dirname, "audio-bc-rx.html"),
       },
     },
   },
