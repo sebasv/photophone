@@ -26,6 +26,8 @@ export default defineConfig({
         index: resolve(__dirname, "index.html"),
         send: resolve(__dirname, "send.html"),
         receive: resolve(__dirname, "receive.html"),
+        "broadcast-send": resolve(__dirname, "broadcast-send.html"),
+        "broadcast-receive": resolve(__dirname, "broadcast-receive.html"),
       },
     },
   },
