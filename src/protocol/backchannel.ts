@@ -165,3 +165,100 @@ export function pickCellSizeFromCapabilities(c: Capabilities): number {
   const range = c.maxCellSizePx - c.minCellSizePx;
   return c.minCellSizePx + Math.floor(range * 0.4);
 }
+
+
+// =========================================================================
+// M13 — ACK / NACK messages (bidirectional ARQ)
+// =========================================================================
+
+/**
+ * Receiver tells the sender which byte ranges it already has (ACK) or
+ * still needs (NACK). The sender uses ACKs to stop retransmitting bytes
+ * the receiver already has, and uses NACKs to prioritize gaps.
+ *
+ * Wire body for both ACK and NACK:
+ *   offset 0  | 1 | range_count (u8) — number of ranges that follow
+ *   for each range:
+ *     offset N   | 4 | offset (u32, big-endian)
+ *     offset N+4 | 2 | length (u16, big-endian)
+ *
+ * Maximum ranges per frame is bounded by the underlying back-channel
+ * frame's payload capacity. With u8 count + 6-byte entries, 32 ranges
+ * fits comfortably under typical frame caps (193 bytes body). The TCP-
+ * equivalent thinks of this as a SACK block list.
+ */
+
+import type { ByteRange } from "./transport";
+
+const RANGE_ENTRY_SIZE = 6; // u32 offset + u16 length
+export const MAX_ARQ_RANGES_PER_FRAME = 32;
+
+function encodeRangeList(ranges: ReadonlyArray<ByteRange>): Uint8Array {
+  if (ranges.length > 0xff) {
+    throw new Error(`encodeRangeList: ${ranges.length} > 255 ranges per frame`);
+  }
+  const body = new Uint8Array(1 + ranges.length * RANGE_ENTRY_SIZE);
+  body[0] = ranges.length;
+  let off = 1;
+  for (const r of ranges) {
+    body[off] = (r.offset >>> 24) & 0xff;
+    body[off + 1] = (r.offset >>> 16) & 0xff;
+    body[off + 2] = (r.offset >>> 8) & 0xff;
+    body[off + 3] = r.offset & 0xff;
+    body[off + 4] = (r.length >>> 8) & 0xff;
+    body[off + 5] = r.length & 0xff;
+    off += RANGE_ENTRY_SIZE;
+  }
+  return body;
+}
+
+function decodeRangeList(body: Uint8Array): ByteRange[] | null {
+  if (body.length < 1) return null;
+  const n = body[0]!;
+  if (body.length < 1 + n * RANGE_ENTRY_SIZE) return null;
+  const out: ByteRange[] = [];
+  let off = 1;
+  for (let i = 0; i < n; i++) {
+    const offset =
+      ((body[off]! << 24) |
+        (body[off + 1]! << 16) |
+        (body[off + 2]! << 8) |
+        body[off + 3]!) >>>
+      0;
+    const length = (body[off + 4]! << 8) | body[off + 5]!;
+    out.push({ offset, length });
+    off += RANGE_ENTRY_SIZE;
+  }
+  return out;
+}
+
+export function encodeAck(ranges: ReadonlyArray<ByteRange>): BackChannelMessage {
+  return { type: BackChannelMessageType.Ack, body: encodeRangeList(ranges) };
+}
+
+export function decodeAck(msg: BackChannelMessage): ByteRange[] | null {
+  if (msg.type !== BackChannelMessageType.Ack) return null;
+  return decodeRangeList(msg.body);
+}
+
+export function encodeNack(ranges: ReadonlyArray<ByteRange>): BackChannelMessage {
+  return { type: BackChannelMessageType.Nack, body: encodeRangeList(ranges) };
+}
+
+export function decodeNack(msg: BackChannelMessage): ByteRange[] | null {
+  if (msg.type !== BackChannelMessageType.Nack) return null;
+  return decodeRangeList(msg.body);
+}
+
+/**
+ * Trim a list of byte ranges to the largest `MAX_ARQ_RANGES_PER_FRAME`
+ * that fit in one back-channel frame. We keep the first N (longest
+ * usually = highest-priority retransmission targets when callers sort
+ * by gap size).
+ */
+export function trimRangesToFitFrame(
+  ranges: ReadonlyArray<ByteRange>,
+): ByteRange[] {
+  if (ranges.length <= MAX_ARQ_RANGES_PER_FRAME) return ranges.slice();
+  return ranges.slice(0, MAX_ARQ_RANGES_PER_FRAME);
+}

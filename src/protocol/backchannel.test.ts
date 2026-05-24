@@ -87,3 +87,58 @@ describe("M12 Capabilities", () => {
     expect(close).toBeLessThan(far);
   });
 });
+
+
+import {
+  MAX_ARQ_RANGES_PER_FRAME,
+  decodeAck,
+  decodeNack,
+  encodeAck,
+  encodeNack,
+  trimRangesToFitFrame,
+} from "./backchannel";
+import type { ByteRange } from "./transport";
+
+describe("M13 ACK/NACK", () => {
+  const SAMPLE: ByteRange[] = [
+    { offset: 0, length: 633 },
+    { offset: 633, length: 633 },
+    { offset: 12345, length: 100 },
+    { offset: 0xfffffffe, length: 1 }, // exercise upper u32 edge
+  ];
+
+  it("ACK round-trip preserves all ranges", () => {
+    const m = encodeAck(SAMPLE);
+    const decoded = decodeAck(m);
+    expect(decoded).toEqual(SAMPLE);
+  });
+
+  it("NACK round-trip preserves all ranges", () => {
+    const m = encodeNack(SAMPLE);
+    expect(decodeNack(m)).toEqual(SAMPLE);
+  });
+
+  it("rejects messages of the wrong type", () => {
+    const ackMsg = encodeAck(SAMPLE);
+    expect(decodeNack(ackMsg)).toBeNull();
+  });
+
+  it("encodes zero-length range list as a 1-byte body", () => {
+    const m = encodeAck([]);
+    expect(m.body.length).toBe(1);
+    expect(decodeAck(m)).toEqual([]);
+  });
+
+  it("rejects a body that's truncated mid-range", () => {
+    const m = encodeAck([{ offset: 100, length: 200 }]);
+    expect(decodeAck({ type: m.type, body: m.body.slice(0, 4) })).toBeNull();
+  });
+
+  it("trimRangesToFitFrame caps at MAX_ARQ_RANGES_PER_FRAME", () => {
+    const many: ByteRange[] = [];
+    for (let i = 0; i < MAX_ARQ_RANGES_PER_FRAME + 10; i++) {
+      many.push({ offset: i * 1000, length: 1 });
+    }
+    expect(trimRangesToFitFrame(many).length).toBe(MAX_ARQ_RANGES_PER_FRAME);
+  });
+});
