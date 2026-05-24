@@ -16,11 +16,20 @@
       <section class="controls">
         <button id="start-camera">Start camera</button>
         <button id="capture-frame" disabled>Capture frame</button>
+        <label class="size-input">
+          <span>Expected size (bytes)</span>
+          <input type="number" id="payload-size" min="1" placeholder="26802" />
+        </label>
+        <button id="stream-button" disabled>Start receiving</button>
+        <button id="save-button" disabled>Save as file</button>
         <span id="status" class="status">idle</span>
         <label class="diagnostics-toggle">
           <input type="checkbox" id="diagnostics-toggle" />
           <span>Show diagnostics</span>
         </label>
+      </section>
+      <section class="output progress" id="progress-section">
+        <pre id="progress-output"></pre>
       </section>
       <section class="stage">
         <video id="camera-video" playsinline autoplay muted></video>

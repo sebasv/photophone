@@ -254,3 +254,26 @@ button:disabled {
   border-radius: 6px;
   background: #0a0a0a;
 }
+
+.size-input {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.size-input input {
+  background: #111;
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.45rem 0.6rem;
+  font: inherit;
+  width: 9rem;
+}
+
+.progress pre {
+  color: var(--accent);
+  font-size: 0.85rem;
+}
