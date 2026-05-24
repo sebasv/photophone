@@ -58,6 +58,13 @@ let reassembly: ReassemblyState | null = null;
 let packetsAccepted = 0;
 let packetsRejected = 0;
 let framesProcessed = 0;
+const rejectCounts: Record<string, number> = {
+  "rejected-malformed": 0,
+  "rejected-version": 0,
+  "rejected-session": 0,
+  "out-of-bounds": 0,
+};
+let lastRejectPeek: { reason: string; offset: number; length: number; sessionId: number } | null = null;
 
 // -------------------------------------------------------------------------
 // Diagnostics toggle wiring (unchanged from M4.5)
@@ -169,6 +176,8 @@ function startStreaming(): void {
   packetsAccepted = 0;
   packetsRejected = 0;
   framesProcessed = 0;
+  for (const k of Object.keys(rejectCounts)) rejectCounts[k] = 0;
+  lastRejectPeek = null;
   streaming = true;
   streamButton.textContent = "Stop receiving";
   saveButton.disabled = true;
@@ -199,8 +208,15 @@ function streamTick(): void {
     const wire = decodedWireBytes(captured.diagnostics);
     if (wire) {
       const result = ingest(reassembly, wire);
-      if (result === "accepted") packetsAccepted++;
-      else if (result !== "duplicate") packetsRejected++;
+      if (result === "accepted") {
+        packetsAccepted++;
+      } else if (result === "duplicate") {
+        // Don't count toward either; receiver saw this byte range already.
+      } else {
+        packetsRejected++;
+        rejectCounts[result] = (rejectCounts[result] ?? 0) + 1;
+        lastRejectPeek = peekRejectedHeader(wire, result);
+      }
     }
     renderCapture(captured);
   }
@@ -227,12 +243,22 @@ function updateProgress(): void {
   const totalReceived = reassembly.received.reduce((s, r) => s + r.length, 0);
   const pct = (totalReceived / reassembly.payloadSize) * 100;
   const gaps = missing(reassembly);
+  const rejectBreakdown = Object.entries(rejectCounts)
+    .filter(([, count]) => count > 0)
+    .map(([reason, count]) => `${reason}: ${count}`)
+    .join(", ");
+  const lastRejectLine = lastRejectPeek
+    ? `\nlast rejection (${lastRejectPeek.reason}): session=0x${lastRejectPeek.sessionId.toString(16).padStart(8, "0")} offset=${lastRejectPeek.offset} len=${lastRejectPeek.length}`
+    : "";
   progressLine.textContent =
     `frames processed: ${framesProcessed}\n` +
-    `packets accepted: ${packetsAccepted}    rejected: ${packetsRejected}\n` +
+    `packets accepted: ${packetsAccepted}    rejected: ${packetsRejected}` +
+    (rejectBreakdown ? ` (${rejectBreakdown})` : "") +
+    `\n` +
     `received bytes: ${totalReceived} / ${reassembly.payloadSize} (${pct.toFixed(1)}%)\n` +
     `${formatProgressBar(reassembly.payloadSize, reassembly.received, 60)}\n` +
-    `missing ranges: ${gaps.length === 0 ? "none — complete!" : gaps.slice(0, 3).map((g) => `[${g.offset}+${g.length}]`).join(" ") + (gaps.length > 3 ? ` … (+${gaps.length - 3} more)` : "")}`;
+    `missing ranges: ${gaps.length === 0 ? "none — complete!" : gaps.slice(0, 3).map((g) => `[${g.offset}+${g.length}]`).join(" ") + (gaps.length > 3 ? ` … (+${gaps.length - 3} more)` : "")}` +
+    lastRejectLine;
 }
 
 function formatProgressBar(
@@ -535,4 +561,30 @@ function isPngHeader(bytes: Uint8Array): boolean {
     if (bytes[i] !== magic[i]) return false;
   }
   return true;
+}
+
+
+/**
+ * Without RS in the wire (M7 isn't yet integrated into send/receive), a
+ * single misclassified cell in bytes 10-13 of the packet header corrupts
+ * the u32 payload_offset to an arbitrary value, and ingest rejects with
+ * "out-of-bounds" or "rejected-malformed". To make this visible while
+ * streaming we peek at what the receiver actually parsed out of the wire
+ * after a rejection, so the user can tell at a glance whether the offset
+ * looks plausible or astronomically wrong.
+ */
+function peekRejectedHeader(
+  wire: Uint8Array,
+  reason: string,
+): { reason: string; offset: number; length: number; sessionId: number } {
+  if (wire.length < 16) {
+    return { reason, offset: -1, length: -1, sessionId: -1 };
+  }
+  const view = new DataView(wire.buffer, wire.byteOffset, 16);
+  return {
+    reason,
+    sessionId: view.getUint32(6, false),
+    offset: view.getUint32(10, false),
+    length: view.getUint16(14, false),
+  };
 }
