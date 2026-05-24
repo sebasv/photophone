@@ -246,3 +246,11 @@ button:disabled {
   font-size: 0.78rem;
   color: var(--muted);
 }
+
+.palette-swatches {
+  display: block;
+  margin-bottom: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0a0a0a;
+}
