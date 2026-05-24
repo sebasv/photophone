@@ -528,6 +528,50 @@ This is when Photophone formally becomes a *file* transfer rather than a *byte s
 - M10+: payload type is no longer a meaningful protocol concept.
 
 
+## 9.3 Practical limits
+
+The protocol's headers and decoder data structures imply a few payload-size and memory bounds. These aren't accidental — they're trade-offs picked at specific points in the design. Logged here so future-us doesn't re-derive them.
+
+### Payload size
+
+**Unicast — 4 GB hard limit.** The packet header carries `payload_offset` as a u32 (§5), so any single transfer is bounded by `payload_offset + payload_len ≤ 2³² = 4 GiB`. Above that we'd have to widen the offset to u64, costing 4 extra header bytes per packet.
+
+**Broadcast — ~45 MB practical limit.** The bootstrap region (§4.1) carries `source_count (K)` as a u16, so K ≤ 65 535. With a typical source packet of ~700 bytes (after Reed-Solomon overhead and the bootstrap-region tax), max broadcast payload ≈ 65 535 × 700 B ≈ **45 MB**.
+
+**Rationale — why 65 535 source packets is enough.** At first glance it sounds tight, but in broadcast operating terms it isn't. Cycling through all K source packets once at 120 fps takes:
+
+```
+65 535 packets ÷ 120 fps = 546 s ≈ 9.1 minutes
+```
+
+Nine minutes of continuous one-pass broadcast at the headline frame rate. That's deep into "interesting demos" territory — meeting handouts, mid-sized PDFs, a folder of photos. Pushing K above u16 would force us to widen the bootstrap region (and drop a corresponding chunk of payload cells per frame, since bootstrap is embedded in every frame). The u16 is the right point on the curve for the use cases we care about; we can revisit when payload sizes start brushing 45 MB in practice.
+
+### Memory
+
+Receiver memory is **O(payload-size)** in both modes, with two distinct contributions depending on which mode is active:
+
+- **Reassembly buffer (unicast).** `newReassembly(session, payloadSize)` pre-allocates `Uint8Array(payloadSize)`. A sparse interval set tracks received byte ranges; its overhead is bounded by ≤ K entries between merges, negligible relative to the buffer itself.
+- **Fountain decoder (broadcast).** `recovered: Map<number, Uint8Array>` holds up to K source packets = N bytes once peeling completes. A `pending[]` queue of in-flight rows adds O(K) overhead during peeling but never exceeds total received bytes.
+
+Neither layer can be made sub-linear by an obvious trick. Fountain XOR equations link any byte to any other source packet — a recovered source can't be released until peeling finishes, because a later encoded packet might reduce against it and others. **Streaming-to-disk decoding** would let us page recovered sources out as they complete, with non-trivial complexity. Pick up when single-payload sizes start mattering in practice (likely never for the demo-scale use cases we have in mind).
+
+### Throughput
+
+Per-frame byte capacity × frame rate. Both ends of that product are tunable:
+
+- **Frame capacity** ≈ 600 bytes at the default 64×64 / 2-bit / `nsym=32` configuration (`payload_cells × 2 bits ÷ 8 − header − bootstrap − ECC parity`).
+- **Frame rate** is bounded by camera fps (typically 30–60 on consumer hardware) and the sender's render cadence.
+
+So roughly **18 kB/s at 30 fps**, **36 kB/s at 60 fps** with current defaults. The headline `hello_world.png` (26 802 bytes) transfers in ≲ 2 s at 60 fps assuming no frame drops — more in real conditions. The Performance pass (M15) will quantify this against real cameras.
+
+### Deferred refinements
+
+| When | What |
+| --- | --- |
+| Payload sizes brushing 45 MB | Widen `source_count` to u24 / u32 in the bootstrap region; trade a few cells. |
+| Single-payload memory becomes painful (>~1 GB) | Streaming-to-disk decoding — release recovered sources as peeling completes. |
+| Unicast use cases need > 4 GB transfers | Widen `payload_offset` to u64; +4 header bytes per packet. |
+
 ## 10. Out of scope (forever or until requested)
 
 - Native mobile apps. Browser-only.
