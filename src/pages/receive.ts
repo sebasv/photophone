@@ -1,4 +1,13 @@
 import "../style.css";
+// PWA service-worker registration. send.html and receive.html don't
+// import main.ts, so without this each page would keep serving stale
+// assets from the SW cache forever after a deploy (autoUpdate's reload
+// trigger only fires from pages that called registerSW).
+if ("serviceWorker" in navigator) {
+  import("virtual:pwa-register").then(({ registerSW }) => {
+    registerSW({ immediate: true });
+  });
+}
 import {
   DEFAULT_GEOMETRY,
   PALETTE_2BIT,
