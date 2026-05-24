@@ -262,3 +262,223 @@ export function trimRangesToFitFrame(
   if (ranges.length <= MAX_ARQ_RANGES_PER_FRAME) return ranges.slice();
   return ranges.slice(0, MAX_ARQ_RANGES_PER_FRAME);
 }
+
+
+// =========================================================================
+// M14 — Stats message (continuous link adaptation)
+// =========================================================================
+
+/**
+ * Receiver continuously reports decode-quality stats so the sender can
+ * adapt density on the fly. We send a single 8-byte body:
+ *
+ *   offset 0 | 3 | frame_error_rate_ppm (u24)  — frames-failed-RS / total, in parts per million (0..1_000_000)
+ *   offset 3 | 1 | mean_otsu_threshold  (u8)   — proxy for ambient lighting
+ *   offset 4 | 1 | mean_classify_conf   (u8)   — 0=barely classifiable, 255=clean cells
+ *   offset 5 | 2 | window_frames        (u16)  — over how many recent frames the stats average
+ *   offset 7 | 1 | reserved
+ *
+ * Send these continuously at ~1 Hz; the sender's controller runs on
+ * each one.
+ */
+
+export const STATS_BODY_SIZE = 8;
+
+export interface DecodeStats {
+  /** FER ratio expressed as parts per million (0..1_000_000). */
+  ferPpm: number;
+  meanOtsuThreshold: number;
+  meanClassifyConfidence: number;
+  windowFrames: number;
+}
+
+export function encodeStats(s: DecodeStats): BackChannelMessage {
+  // ferPpm is up to 1_000_000 — needs 24 bits, not 16.
+  const body = new Uint8Array(STATS_BODY_SIZE);
+  body[0] = (s.ferPpm >>> 16) & 0xff;
+  body[1] = (s.ferPpm >>> 8) & 0xff;
+  body[2] = s.ferPpm & 0xff;
+  body[3] = s.meanOtsuThreshold & 0xff;
+  body[4] = s.meanClassifyConfidence & 0xff;
+  body[5] = (s.windowFrames >>> 8) & 0xff;
+  body[6] = s.windowFrames & 0xff;
+  return { type: BackChannelMessageType.Stats, body };
+}
+
+export function decodeStats(msg: BackChannelMessage): DecodeStats | null {
+  if (msg.type !== BackChannelMessageType.Stats) return null;
+  if (msg.body.length < STATS_BODY_SIZE) return null;
+  return {
+    ferPpm: ((msg.body[0]! << 16) | (msg.body[1]! << 8) | msg.body[2]!) >>> 0,
+    meanOtsuThreshold: msg.body[3]!,
+    meanClassifyConfidence: msg.body[4]!,
+    windowFrames: (msg.body[5]! << 8) | msg.body[6]!,
+  };
+}
+
+// =========================================================================
+// M14 — Adaptive controller
+// =========================================================================
+
+export interface AdaptiveLinkParams {
+  /** Effective cell pitch the sender renders at (and the receiver expects). */
+  cellSizePx: number;
+  /** Reed-Solomon parity bytes per 255-byte block. */
+  rsNsym: number;
+  /** Frames per second the sender renders. */
+  fps: number;
+}
+
+export const DEFAULT_LINK_PARAMS: AdaptiveLinkParams = {
+  cellSizePx: 12,
+  rsNsym: 32,
+  fps: 5,
+};
+
+/**
+ * Discrete tiers we step through. Picking from a small ladder rather
+ * than continuously avoids oscillation and keeps the encoder warm-cache-
+ * friendly. Each tier is a (cellSizePx, rsNsym, fps) triple.
+ *
+ * Tier 0 is the most aggressive (densest, smallest cells, lowest
+ * parity); tier N is the most conservative.
+ */
+export const LINK_TIERS: ReadonlyArray<AdaptiveLinkParams> = [
+  { cellSizePx: 8,  rsNsym: 16, fps: 10 },
+  { cellSizePx: 10, rsNsym: 24, fps: 8 },
+  { cellSizePx: 12, rsNsym: 32, fps: 5 },
+  { cellSizePx: 16, rsNsym: 40, fps: 4 },
+  { cellSizePx: 20, rsNsym: 48, fps: 3 },
+  { cellSizePx: 24, rsNsym: 56, fps: 2 },
+];
+
+export function tierIndexOf(p: AdaptiveLinkParams): number {
+  let bestIdx = 0;
+  let bestDelta = Infinity;
+  for (let i = 0; i < LINK_TIERS.length; i++) {
+    const t = LINK_TIERS[i]!;
+    const d =
+      Math.abs(t.cellSizePx - p.cellSizePx) * 4 +
+      Math.abs(t.rsNsym - p.rsNsym);
+    if (d < bestDelta) {
+      bestDelta = d;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
+/**
+ * Pick the next link parameter tier given recent decode stats. Simple
+ * threshold controller:
+ *   - FER > 30% → step UP (more conservative)
+ *   - FER < 5%  → step DOWN (more aggressive, if we have headroom)
+ *   - else      → hold
+ *
+ * Plus a confidence backstop: very low classify confidence forces a
+ * conservative step regardless of FER (the few frames that did decode
+ * were lucky).
+ */
+export function adaptiveStep(
+  current: AdaptiveLinkParams,
+  stats: DecodeStats,
+): AdaptiveLinkParams {
+  const idx = tierIndexOf(current);
+  const ferFraction = stats.ferPpm / 1_000_000;
+  const confidence = stats.meanClassifyConfidence / 255;
+  let next = idx;
+  if (ferFraction > 0.3 || confidence < 0.3) {
+    next = Math.min(idx + 1, LINK_TIERS.length - 1);
+  } else if (ferFraction < 0.05 && confidence > 0.7) {
+    next = Math.max(idx - 1, 0);
+  }
+  return LINK_TIERS[next]!;
+}
+
+
+// =========================================================================
+// M14 — Per-frame config indicator (the 16-cell strip in framing.ts)
+// =========================================================================
+
+/**
+ * The 16-cell config strip at the top of every frame (DESIGN.md §4)
+ * carries decoder parameters that may change mid-stream. The receiver
+ * decodes this strip *first*, with worst-case classifier parameters,
+ * then applies the indicated config to the rest of the frame.
+ *
+ * 16 cells × 1 bit/cell = 16 bits = 2 bytes. We use a high-contrast
+ * 2-colour palette (black vs the brightest palette colour) when
+ * rendering this strip, so it remains classifiable when the rest of
+ * the frame is at the edge of usability.
+ *
+ * Bit layout (LSB-first within each byte for ease of bit-by-bit decode):
+ *   bit  0     : mode (0=unicast, 1=broadcast)
+ *   bit  1     : frame_type (0=payload, 1=bootstrap-only)
+ *   bits 2..4  : palette_id (0..7)
+ *   bits 5..7  : link_tier (index into LINK_TIERS)
+ *   bits 8..15 : reserved
+ */
+
+export interface FrameConfigBits {
+  mode: "unicast" | "broadcast";
+  frameType: "payload" | "bootstrap-only";
+  paletteId: number;
+  linkTier: number;
+}
+
+export const CONFIG_STRIP_BYTES = 2;
+export const CONFIG_STRIP_BITS = CONFIG_STRIP_BYTES * 8;
+
+export function encodeFrameConfigBits(c: FrameConfigBits): Uint8Array {
+  if (c.paletteId < 0 || c.paletteId > 7) {
+    throw new Error(`encodeFrameConfigBits: paletteId out of range: ${c.paletteId}`);
+  }
+  if (c.linkTier < 0 || c.linkTier > 7) {
+    throw new Error(`encodeFrameConfigBits: linkTier out of range: ${c.linkTier}`);
+  }
+  let b0 = 0;
+  if (c.mode === "broadcast") b0 |= 0x01;
+  if (c.frameType === "bootstrap-only") b0 |= 0x02;
+  b0 |= (c.paletteId & 0x07) << 2;
+  b0 |= (c.linkTier & 0x07) << 5;
+  return new Uint8Array([b0, 0]);
+}
+
+export function decodeFrameConfigBits(bytes: Uint8Array): FrameConfigBits | null {
+  if (bytes.length < CONFIG_STRIP_BYTES) return null;
+  const b0 = bytes[0]!;
+  return {
+    mode: b0 & 0x01 ? "broadcast" : "unicast",
+    frameType: b0 & 0x02 ? "bootstrap-only" : "payload",
+    paletteId: (b0 >>> 2) & 0x07,
+    linkTier: (b0 >>> 5) & 0x07,
+  };
+}
+
+/** Convenience: convert 2 config bytes to a 16-bit array for rendering one
+ *  cell per bit at the config-strip positions. */
+export function configBitsToCellArray(bytes: Uint8Array): Uint8Array {
+  const out = new Uint8Array(CONFIG_STRIP_BITS);
+  for (let i = 0; i < CONFIG_STRIP_BYTES; i++) {
+    for (let b = 0; b < 8; b++) {
+      out[i * 8 + b] = (bytes[i]! >> b) & 1;
+    }
+  }
+  return out;
+}
+
+/** Inverse of configBitsToCellArray — reconstruct 2 bytes from 16 sampled bits. */
+export function cellArrayToConfigBits(cells: ArrayLike<number>): Uint8Array {
+  if (cells.length < CONFIG_STRIP_BITS) {
+    throw new Error(`cellArrayToConfigBits: need ${CONFIG_STRIP_BITS} cells, got ${cells.length}`);
+  }
+  const out = new Uint8Array(CONFIG_STRIP_BYTES);
+  for (let i = 0; i < CONFIG_STRIP_BYTES; i++) {
+    let b = 0;
+    for (let k = 0; k < 8; k++) {
+      b |= ((cells[i * 8 + k]! as number) & 1) << k;
+    }
+    out[i] = b;
+  }
+  return out;
+}
