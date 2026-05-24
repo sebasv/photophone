@@ -28,6 +28,8 @@ export default defineConfig({
         receive: resolve(__dirname, "receive.html"),
         "broadcast-send": resolve(__dirname, "broadcast-send.html"),
         "broadcast-receive": resolve(__dirname, "broadcast-receive.html"),
+        "backchannel-tx": resolve(__dirname, "backchannel-tx.html"),
+        "backchannel-rx": resolve(__dirname, "backchannel-rx.html"),
       },
     },
   },

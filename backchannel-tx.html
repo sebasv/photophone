@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0a0a0a" />
+    <title>Photophone · Back-channel transmit</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <main class="page page--send">
+      <header class="page__header">
+        <a href="/" class="back">← back</a>
+        <h1>Back-channel transmit</h1>
+      </header>
+      <p class="tagline">Standalone test page for the M11 visual back-channel. Type a short hello, render the frame, point the back-channel receiver's camera at this canvas.</p>
+      <section class="controls">
+        <label class="size-input">
+          <span>Message</span>
+          <input type="text" id="bc-message" value="hello back" />
+        </label>
+        <button id="bc-render">Render frame</button>
+        <button id="bc-loop">Start loop (5 fps)</button>
+        <span id="status" class="status">idle</span>
+      </section>
+      <section class="stage">
+        <canvas id="bc-canvas"></canvas>
+      </section>
+    </main>
+    <script type="module" src="/src/pages/backchannel-tx.ts"></script>
+  </body>
+</html>

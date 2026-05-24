@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0a0a0a" />
+    <title>Photophone · Back-channel receive</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <main class="page page--receive">
+      <header class="page__header">
+        <a href="/" class="back">← back</a>
+        <h1>Back-channel receive</h1>
+      </header>
+      <p class="tagline">Standalone test page for the M11 visual back-channel. Point the camera at a back-channel-transmit screen; decoded hello messages appear below.</p>
+      <section class="controls">
+        <button id="start-camera">Start camera</button>
+        <button id="stream-button" disabled>Start receiving</button>
+        <span id="status" class="status">idle</span>
+      </section>
+      <section class="stage">
+        <video id="camera-video" playsinline autoplay muted></video>
+      </section>
+      <section class="stage stage--secondary">
+        <canvas id="capture-preview"></canvas>
+      </section>
+      <section class="output">
+        <pre id="bc-log">No messages decoded yet.</pre>
+      </section>
+    </main>
+    <script type="module" src="/src/pages/backchannel-rx.ts"></script>
+  </body>
+</html>

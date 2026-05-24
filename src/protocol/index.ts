@@ -18,3 +18,4 @@ export {
   ingestEncodedPacket,
   recoverPayload,
 } from "./fountain";
+export * from "./backchannel";
