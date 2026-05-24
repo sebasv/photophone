@@ -1,4 +1,13 @@
 import "../style.css";
+// PWA service-worker registration. send.html and receive.html don't
+// import main.ts, so without this each page would keep serving stale
+// assets from the SW cache forever after a deploy (autoUpdate's reload
+// trigger only fires from pages that called registerSW).
+if ("serviceWorker" in navigator) {
+  import("virtual:pwa-register").then(({ registerSW }) => {
+    registerSW({ immediate: true });
+  });
+}
 import {
   DEFAULT_GEOMETRY,
   PALETTE_2BIT,
@@ -6,10 +15,10 @@ import {
   decodeFrameWarpedWithDiagnostics,
   decodePacket,
   ingest,
-  isComplete,
   missing,
   newReassembly,
-  reassemble,
+  payloadCellCount,
+  rsDecodeAll,
   type DecodeFrameWarpedDiagnostics,
   type PDPCandidate,
   type Point,
@@ -33,11 +42,15 @@ const SESSION: SessionInfo = { sessionId: 0xdeadbeef };
 const DIAGNOSTICS_STORAGE_KEY = "photophone.diagnostics.enabled";
 const STREAM_INTERVAL_MS = 100; // 10 fps decode cadence
 
+// Reed-Solomon protection parameters. Must match the sender (send.ts).
+const NSYM = 32;
+const RS_BLOCKS = Math.floor((payloadCellCount(DEFAULT_GEOMETRY) * 2 / 8) / 255);
+const RS_ENCODED_BYTES = RS_BLOCKS * 255;
+
 const startButton = document.querySelector<HTMLButtonElement>("#start-camera")!;
 const captureButton = document.querySelector<HTMLButtonElement>("#capture-frame")!;
 const streamButton = document.querySelector<HTMLButtonElement>("#stream-button")!;
 const saveButton = document.querySelector<HTMLButtonElement>("#save-button")!;
-const payloadSizeInput = document.querySelector<HTMLInputElement>("#payload-size")!;
 const video = document.querySelector<HTMLVideoElement>("#camera-video")!;
 const status = document.querySelector<HTMLSpanElement>("#status")!;
 const output = document.querySelector<HTMLPreElement>("#decoded-output")!;
@@ -59,10 +72,10 @@ let packetsAccepted = 0;
 let packetsRejected = 0;
 let framesProcessed = 0;
 const rejectCounts: Record<string, number> = {
+  "rs-decode-failed": 0,
   "rejected-malformed": 0,
   "rejected-version": 0,
   "rejected-session": 0,
-  "out-of-bounds": 0,
 };
 let lastRejectPeek: { reason: string; offset: number; length: number; sessionId: number } | null = null;
 
@@ -166,13 +179,7 @@ streamButton.addEventListener("click", () => {
 });
 
 function startStreaming(): void {
-  const sizeText = payloadSizeInput.value.trim();
-  const totalBytes = sizeText === "" ? 26802 : parseInt(sizeText, 10);
-  if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
-    status.textContent = "Enter a positive expected payload size in bytes";
-    return;
-  }
-  reassembly = newReassembly(SESSION, totalBytes);
+  reassembly = newReassembly(SESSION);
   packetsAccepted = 0;
   packetsRejected = 0;
   framesProcessed = 0;
@@ -221,18 +228,26 @@ function streamTick(): void {
     renderCapture(captured);
   }
   updateProgress();
-  if (reassembly && isComplete(reassembly)) {
+  if (reassembly && reassembly.received.length > 0 && reassembly.received[0]!.offset === 0) {
+    // Enable Save as soon as there's any contiguous prefix to save.
     saveButton.disabled = false;
-    stopStreaming();
-    status.textContent = "complete — click Save to download the result";
-    return;
   }
   scheduleNextStreamTick();
 }
 
 function decodedWireBytes(d: DecodeFrameWarpedDiagnostics): Uint8Array | null {
   if (!d.result) return null;
-  return cellsToBytes(d.result.cells, PALETTE_2BIT);
+  const allBytes = cellsToBytes(d.result.cells, PALETTE_2BIT);
+  if (allBytes.length < RS_ENCODED_BYTES) return null;
+  const ecc = allBytes.subarray(0, RS_ENCODED_BYTES);
+  try {
+    return rsDecodeAll(ecc, NSYM);
+  } catch {
+    rejectCounts["rs-decode-failed"]! += 1;
+    packetsRejected++;
+    lastRejectPeek = { reason: "rs-decode-failed", offset: -1, length: -1, sessionId: -1 };
+    return null;
+  }
 }
 
 function updateProgress(): void {
@@ -240,8 +255,9 @@ function updateProgress(): void {
     progressLine.textContent = "";
     return;
   }
-  const totalReceived = reassembly.received.reduce((s, r) => s + r.length, 0);
-  const pct = (totalReceived / reassembly.payloadSize) * 100;
+  const first = reassembly.received[0];
+  const contiguousFromZero = first && first.offset === 0 ? first.length : 0;
+  const highest = reassembly.highestByte;
   const gaps = missing(reassembly);
   const rejectBreakdown = Object.entries(rejectCounts)
     .filter(([, count]) => count > 0)
@@ -255,9 +271,9 @@ function updateProgress(): void {
     `packets accepted: ${packetsAccepted}    rejected: ${packetsRejected}` +
     (rejectBreakdown ? ` (${rejectBreakdown})` : "") +
     `\n` +
-    `received bytes: ${totalReceived} / ${reassembly.payloadSize} (${pct.toFixed(1)}%)\n` +
-    `${formatProgressBar(reassembly.payloadSize, reassembly.received, 60)}\n` +
-    `missing ranges: ${gaps.length === 0 ? "none — complete!" : gaps.slice(0, 3).map((g) => `[${g.offset}+${g.length}]`).join(" ") + (gaps.length > 3 ? ` … (+${gaps.length - 3} more)` : "")}` +
+    `contiguous from 0: ${contiguousFromZero} bytes    highest seen: ${highest} bytes\n` +
+    `${formatProgressBar(Math.max(highest, 1), reassembly.received, 60)}\n` +
+    `gaps below highest: ${gaps.length === 0 ? "none" : gaps.slice(0, 3).map((g) => `[${g.offset}+${g.length}]`).join(" ") + (gaps.length > 3 ? ` … (+${gaps.length - 3} more)` : "")}` +
     lastRejectLine;
 }
 
@@ -281,20 +297,12 @@ function formatProgressBar(
 
 saveButton.addEventListener("click", () => {
   if (!reassembly || reassembly.received.length === 0) return;
-  // Use the contiguous-from-zero region if reassembly isn't complete, or
-  // the full buffer if it is.
-  let bytes: Uint8Array;
-  if (isComplete(reassembly)) {
-    bytes = reassemble(reassembly);
-  } else {
-    // Take the longest contiguous run starting at offset 0.
-    const first = reassembly.received[0];
-    if (!first || first.offset !== 0) {
-      status.textContent = "no contiguous prefix to save (first received range doesn't start at offset 0)";
-      return;
-    }
-    bytes = reassembly.buffer.slice(0, first.length);
+  const first = reassembly.received[0];
+  if (!first || first.offset !== 0) {
+    status.textContent = "no contiguous prefix to save (first received range doesn't start at offset 0)";
+    return;
   }
+  const bytes = reassembly.buffer.slice(0, first.length);
   const blob = new Blob([new Uint8Array(bytes)], { type: "application/octet-stream" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -387,7 +395,24 @@ function renderOutputText(d: DecodeFrameWarpedDiagnostics): void {
     if (!streaming) status.textContent = "capture failed";
     return;
   }
-  const bytes = cellsToBytes(result.cells, PALETTE_2BIT);
+  const allBytes = cellsToBytes(result.cells, PALETTE_2BIT);
+  if (allBytes.length < RS_ENCODED_BYTES) {
+    output.textContent = `Capture decoded only ${allBytes.length} bytes; expected at least ${RS_ENCODED_BYTES} for RS unwrap.`;
+    if (!streaming) status.textContent = "decode short";
+    return;
+  }
+  let bytes: Uint8Array;
+  try {
+    bytes = rsDecodeAll(allBytes.subarray(0, RS_ENCODED_BYTES), NSYM);
+  } catch (err) {
+    output.textContent =
+      `Reed-Solomon decode failed: ${(err as Error).message}\n\n` +
+      `Means more than ${Math.floor(NSYM / 2)} byte errors in at least one ` +
+      `RS block. Try better lighting, less motion blur, or hold the camera ` +
+      `closer to the sender's canvas.`;
+    if (!streaming) status.textContent = "RS decode failed";
+    return;
+  }
   const packet = decodePacket(bytes, SESSION);
   if (!packet) {
     output.textContent =

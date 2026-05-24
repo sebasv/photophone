@@ -67,7 +67,6 @@ describe("packetize", () => {
     const offsets = packets.map((p) => decodePacket(p, SESSION)!.payloadOffset);
     expect(offsets).toEqual([0, 1000, 2000]);
 
-    // Last packet's payload is the residual.
     const last = decodePacket(packets[2]!, SESSION)!;
     expect(last.payload.length).toBe(500);
   });
@@ -78,16 +77,18 @@ describe("packetize", () => {
 });
 
 describe("reassembly state machine", () => {
-  it("accepts packets in any order and reports missing byte ranges", () => {
+  it("accepts packets in any order and reports gaps below the highest seen byte", () => {
     const original = new Uint8Array(2500);
     for (let i = 0; i < original.length; i++) original[i] = i & 0xff;
 
     const packets = packetize(original, 1000, SESSION);
-    const state = newReassembly(SESSION, original.length);
+    const state = newReassembly(SESSION);
 
-    expect(missing(state)).toEqual([{ offset: 0, length: 2500 }]);
+    // Before any packet, no bytes are visible — no gaps reported.
+    expect(missing(state)).toEqual([]);
 
     expect(ingest(state, packets[2]!)).toBe("accepted");
+    // packets[2] is at offset 2000, len 500 → highestByte 2500, gap [0, 2000).
     expect(missing(state)).toEqual([{ offset: 0, length: 2000 }]);
 
     expect(ingest(state, packets[0]!)).toBe("accepted");
@@ -103,7 +104,7 @@ describe("reassembly state machine", () => {
   });
 
   it("merges adjacent and overlapping ranges into a single interval", () => {
-    const state = newReassembly(SESSION, 1000);
+    const state = newReassembly(SESSION);
 
     ingest(state, encodePacket(0, new Uint8Array(200), SESSION));
     ingest(state, encodePacket(400, new Uint8Array(200), SESSION));
@@ -112,55 +113,69 @@ describe("reassembly state machine", () => {
       { offset: 400, length: 200 },
     ]);
 
-    // Fill the gap; everything should coalesce into one range.
     ingest(state, encodePacket(200, new Uint8Array(200), SESSION));
     expect(state.received).toEqual([{ offset: 0, length: 600 }]);
 
-    // Adjacent extension (no gap).
     ingest(state, encodePacket(600, new Uint8Array(100), SESSION));
     expect(state.received).toEqual([{ offset: 0, length: 700 }]);
 
-    // Overlapping extension absorbs an existing tail piece.
     ingest(state, encodePacket(800, new Uint8Array(150), SESSION));
     ingest(state, encodePacket(650, new Uint8Array(300), SESSION));
     expect(state.received).toEqual([{ offset: 0, length: 950 }]);
   });
 
-  it("rejects packets that would overrun the payload buffer", () => {
-    const state = newReassembly(SESSION, 100);
-    const wire = encodePacket(80, new Uint8Array(40), SESSION);
-    expect(ingest(state, wire)).toBe("out-of-bounds");
+  it("grows the buffer to fit arbitrarily high offsets", () => {
+    const state = newReassembly(SESSION);
+    expect(state.buffer.length).toBe(0);
+    expect(state.highestByte).toBe(0);
+
+    // First packet at moderate offset triggers initial allocation.
+    ingest(state, encodePacket(10_000, new Uint8Array(500), SESSION));
+    expect(state.highestByte).toBe(10_500);
+    expect(state.buffer.length).toBeGreaterThanOrEqual(10_500);
+
+    // Subsequent packet far past current capacity triggers another doubling.
+    ingest(state, encodePacket(1_000_000, new Uint8Array(100), SESSION));
+    expect(state.highestByte).toBe(1_000_100);
+    expect(state.buffer.length).toBeGreaterThanOrEqual(1_000_100);
   });
 
   it("rejects packets from foreign sessions", () => {
     const stranger = encodePacket(0, new Uint8Array([1, 2, 3]), {
       sessionId: 0x1234,
     });
-    const state = newReassembly(SESSION, 100);
+    const state = newReassembly(SESSION);
     expect(ingest(state, stranger)).toBe("rejected-session");
     expect(state.received).toEqual([]);
   });
 
-  it("throws on reassemble before complete, with the missing list in the error", () => {
-    const packets = packetize(new Uint8Array(100), 30, SESSION);
-    const state = newReassembly(SESSION, 100);
-    ingest(state, packets[0]!);
-    expect(() => reassemble(state)).toThrow(/missing/);
+  it("reassemble throws when no packet at offset 0 has been received", () => {
+    const state = newReassembly(SESSION);
+    ingest(state, encodePacket(500, new Uint8Array(50), SESSION));
+    expect(() => reassemble(state)).toThrow(/contiguous prefix/);
+  });
+
+  it("reassemble returns the contiguous prefix from offset 0 mid-stream", () => {
+    const state = newReassembly(SESSION);
+    const original = new Uint8Array(300);
+    for (let i = 0; i < original.length; i++) original[i] = (i * 11) & 0xff;
+    ingest(state, encodePacket(0, original.subarray(0, 200), SESSION));
+    // Non-contiguous packet at offset 500 (creates a gap, but contiguous-from-0 is still 200).
+    ingest(state, encodePacket(500, new Uint8Array(50), SESSION));
+    const prefix = reassemble(state);
+    expect(prefix.length).toBe(200);
+    expect(prefix).toEqual(original.subarray(0, 200));
   });
 });
 
 describe("variable-capacity retransmit", () => {
   it("fills a missing range with multiple smaller packets at lower capacity", () => {
-    // Simulates the user's scenario: an original ~956-byte packet covered
-    // bytes [16252, 17208). Capacity drops to 400 bytes. We re-send the
-    // missing range as three smaller packets and reassembly closes the gap.
     const totalSize = 30000;
     const original = new Uint8Array(totalSize);
     for (let i = 0; i < totalSize; i++) original[i] = (i * 7) & 0xff;
 
-    const state = newReassembly(SESSION, totalSize);
+    const state = newReassembly(SESSION);
 
-    // First pass: deliver everything except the range [16252, 17208).
     const firstPass = packetize(original, 956, SESSION);
     for (const wire of firstPass) {
       const p = decodePacket(wire, SESSION)!;
@@ -172,9 +187,6 @@ describe("variable-capacity retransmit", () => {
     expect(stillMissing[0]!.offset).toBe(16252);
     expect(stillMissing[0]!.length).toBe(956);
 
-    // Retransmit at lower capacity: 400-byte packets covering the missing
-    // range. The boundary doesn't align with the original packet boundary
-    // — that's the whole point.
     const gap = stillMissing[0]!;
     const retransmitSize = 400;
     let off = gap.offset;
@@ -207,7 +219,7 @@ describe("hello_world.png round-trips through shuffle + drop + restore", () => {
       else delivered.push(shuffled[i]!);
     }
 
-    const state = newReassembly(SESSION, payload.length);
+    const state = newReassembly(SESSION);
     for (const w of delivered) ingest(state, w);
     expect(isComplete(state)).toBe(false);
     expect(missing(state).length).toBeGreaterThan(0);
@@ -226,7 +238,7 @@ describe("hello_world.png round-trips through shuffle + drop + restore", () => {
     const packetSize = 633;
     const packets = packetize(payload, packetSize, SESSION);
 
-    const state = newReassembly(SESSION, payload.length);
+    const state = newReassembly(SESSION);
     const dropIdx = new Set([3, 17, 41]);
     for (let i = 0; i < packets.length; i++) {
       if (dropIdx.has(i)) continue;
