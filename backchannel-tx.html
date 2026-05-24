@@ -16,8 +16,27 @@
       <p class="tagline">Standalone test page for the M11 visual back-channel. Type a short hello, render the frame, point the back-channel receiver's camera at this canvas.</p>
       <section class="controls">
         <label class="size-input">
-          <span>Message</span>
+          <span>Mode</span>
+          <select id="bc-mode">
+            <option value="hello">Hello (M11)</option>
+            <option value="capabilities">Capabilities (M12)</option>
+          </select>
+        </label>
+        <label class="size-input">
+          <span>Hello text</span>
           <input type="text" id="bc-message" value="hello back" />
+        </label>
+        <label class="size-input">
+          <span>Min cell px</span>
+          <input type="number" id="bc-min-cell" value="6" min="1" max="64" />
+        </label>
+        <label class="size-input">
+          <span>Max cell px</span>
+          <input type="number" id="bc-max-cell" value="16" min="1" max="64" />
+        </label>
+        <label class="size-input">
+          <span>Preferred fps</span>
+          <input type="number" id="bc-fps" value="15" min="1" max="120" />
         </label>
         <button id="bc-render">Render frame</button>
         <button id="bc-loop">Start loop (5 fps)</button>
