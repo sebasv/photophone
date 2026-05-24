@@ -9,7 +9,9 @@ import {
   isComplete,
   missing,
   newReassembly,
+  payloadCellCount,
   reassemble,
+  rsDecodeWireBytes,
   type DecodeFrameWarpedDiagnostics,
   type PDPCandidate,
   type Point,
@@ -32,6 +34,11 @@ import {
 const SESSION: SessionInfo = { sessionId: 0xdeadbeef };
 const DIAGNOSTICS_STORAGE_KEY = "photophone.diagnostics.enabled";
 const STREAM_INTERVAL_MS = 100; // 10 fps decode cadence
+
+// Reed-Solomon protection parameters. Must match the sender (send.ts).
+const NSYM = 32;
+const RS_BLOCKS = Math.floor((payloadCellCount(DEFAULT_GEOMETRY) * 2 / 8) / 255);
+const RS_ENCODED_BYTES = RS_BLOCKS * 255;
 
 const startButton = document.querySelector<HTMLButtonElement>("#start-camera")!;
 const captureButton = document.querySelector<HTMLButtonElement>("#capture-frame")!;
@@ -59,6 +66,7 @@ let packetsAccepted = 0;
 let packetsRejected = 0;
 let framesProcessed = 0;
 const rejectCounts: Record<string, number> = {
+  "rs-decode-failed": 0,
   "rejected-malformed": 0,
   "rejected-version": 0,
   "rejected-session": 0,
@@ -232,7 +240,17 @@ function streamTick(): void {
 
 function decodedWireBytes(d: DecodeFrameWarpedDiagnostics): Uint8Array | null {
   if (!d.result) return null;
-  return cellsToBytes(d.result.cells, PALETTE_2BIT);
+  const allBytes = cellsToBytes(d.result.cells, PALETTE_2BIT);
+  if (allBytes.length < RS_ENCODED_BYTES) return null;
+  const ecc = allBytes.subarray(0, RS_ENCODED_BYTES);
+  try {
+    return rsDecodeWireBytes(ecc, NSYM);
+  } catch {
+    rejectCounts["rs-decode-failed"]! += 1;
+    packetsRejected++;
+    lastRejectPeek = { reason: "rs-decode-failed", offset: -1, length: -1, sessionId: -1 };
+    return null;
+  }
 }
 
 function updateProgress(): void {
@@ -387,7 +405,24 @@ function renderOutputText(d: DecodeFrameWarpedDiagnostics): void {
     if (!streaming) status.textContent = "capture failed";
     return;
   }
-  const bytes = cellsToBytes(result.cells, PALETTE_2BIT);
+  const allBytes = cellsToBytes(result.cells, PALETTE_2BIT);
+  if (allBytes.length < RS_ENCODED_BYTES) {
+    output.textContent = `Capture decoded only ${allBytes.length} bytes; expected at least ${RS_ENCODED_BYTES} for RS unwrap.`;
+    if (!streaming) status.textContent = "decode short";
+    return;
+  }
+  let bytes: Uint8Array;
+  try {
+    bytes = rsDecodeWireBytes(allBytes.subarray(0, RS_ENCODED_BYTES), NSYM);
+  } catch (err) {
+    output.textContent =
+      `Reed-Solomon decode failed: ${(err as Error).message}\n\n` +
+      `Means more than ${Math.floor(NSYM / 2)} byte errors in at least one ` +
+      `RS block. Try better lighting, less motion blur, or hold the camera ` +
+      `closer to the sender's canvas.`;
+    if (!streaming) status.textContent = "RS decode failed";
+    return;
+  }
   const packet = decodePacket(bytes, SESSION);
   if (!packet) {
     output.textContent =

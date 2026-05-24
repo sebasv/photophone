@@ -7,18 +7,27 @@ import {
   packetize,
   payloadCellCount,
   renderFrame,
+  rsEncodeWireBytes,
   type SessionInfo,
 } from "../protocol";
 
 /**
- * Sender — M4 single-frame render + M6 continuous streaming.
+ * Sender — M4 single-frame render + M6 continuous streaming + M8 wire-byte
+ * Reed-Solomon protection.
  *
  * - "Render first frame" displays just the first packet (the original M4
  *   manual-test flow).
  * - "Start streaming" cycles through every packet of the payload at a
  *   fixed frame rate, looping indefinitely so a continuously-watching
- *   receiver can collect missing packets across multiple passes. This is
- *   the M6 sender side.
+ *   receiver can collect missing packets across multiple passes.
+ * - Every wire packet is wrapped with `rsEncodeWireBytes(packet, NSYM)`
+ *   before going onto the cells, so a handful of cell-classification
+ *   errors per frame can be corrected by the receiver. Without this the
+ *   u32 `payload_offset` in the header gets corrupted by a single
+ *   misclassified cell and `ingest` rejects with `out-of-bounds`.
+ *
+ * NSYM is intentionally hardcoded to match the receiver side (see
+ * `receive.ts`). When we change the value, change it in both places.
  */
 
 const SESSION: SessionInfo = { sessionId: 0xdeadbeef };
@@ -37,7 +46,21 @@ let streamIntervalId: ReturnType<typeof setInterval> | null = null;
 
 const capacityCells = payloadCellCount(DEFAULT_GEOMETRY);
 const capacityBytes = (capacityCells * 2) / 8;
-const maxPayloadPerFrame = capacityBytes - HEADER_SIZE;
+
+// Reed-Solomon protection parameters. NSYM bytes of parity per 255-byte
+// codeword; corrects up to NSYM/2 byte errors per block. The number of
+// blocks is whatever fits in the frame; remaining cells are filled with
+// zeros and ignored by the receiver.
+const NSYM = 32;
+const RS_BLOCKS = Math.floor(capacityBytes / 255);
+const RS_ENCODED_BYTES = RS_BLOCKS * 255;
+const RS_DATA_BYTES = RS_BLOCKS * (255 - NSYM);
+
+// `rsEncodeWireBytes` prepends a u16 length prefix inside the protected
+// region, so the actual wire packet (header + payload) we can fit per
+// frame is RS_DATA_BYTES minus that prefix.
+const maxWirePerFrame = RS_DATA_BYTES - 2;
+const maxPayloadPerFrame = maxWirePerFrame - HEADER_SIZE;
 
 fileInput.addEventListener("change", async () => {
   const file = fileInput.files?.[0];
@@ -110,14 +133,18 @@ function stopStreaming(): void {
 }
 
 function renderWirePacket(wirePacket: Uint8Array): void {
-  const cells = bytesToCells(wirePacket, PALETTE_2BIT);
-  if (cells.length > capacityCells) {
-    status.textContent = `internal error: ${cells.length} cells > ${capacityCells} capacity`;
+  const ecc = rsEncodeWireBytes(wirePacket, NSYM);
+  if (ecc.length > RS_ENCODED_BYTES) {
+    status.textContent = `internal error: ECC produced ${ecc.length} bytes > ${RS_ENCODED_BYTES} frame budget`;
     return;
   }
-  const padded = new Uint8Array(capacityCells);
-  padded.set(cells);
-  const img = renderFrame(DEFAULT_GEOMETRY, PALETTE_2BIT, padded, CELL_SIZE_PX);
+  // Pad the ECC output to the full frame byte capacity. The receiver
+  // ignores anything past RS_ENCODED_BYTES, so the padding bytes (and
+  // the cells they encode) are inert.
+  const framePayload = new Uint8Array(capacityBytes);
+  framePayload.set(ecc);
+  const cells = bytesToCells(framePayload, PALETTE_2BIT);
+  const img = renderFrame(DEFAULT_GEOMETRY, PALETTE_2BIT, cells, CELL_SIZE_PX);
   canvas.width = img.width;
   canvas.height = img.height;
   const out = ctx.createImageData(img.width, img.height);
