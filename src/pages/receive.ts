@@ -11,7 +11,7 @@ import {
   newReassembly,
   payloadCellCount,
   reassemble,
-  rsDecodeWireBytes,
+  rsDecodeAll,
   type DecodeFrameWarpedDiagnostics,
   type PDPCandidate,
   type Point,
@@ -244,7 +244,7 @@ function decodedWireBytes(d: DecodeFrameWarpedDiagnostics): Uint8Array | null {
   if (allBytes.length < RS_ENCODED_BYTES) return null;
   const ecc = allBytes.subarray(0, RS_ENCODED_BYTES);
   try {
-    return rsDecodeWireBytes(ecc, NSYM);
+    return rsDecodeAll(ecc, NSYM);
   } catch {
     rejectCounts["rs-decode-failed"]! += 1;
     packetsRejected++;
@@ -413,7 +413,7 @@ function renderOutputText(d: DecodeFrameWarpedDiagnostics): void {
   }
   let bytes: Uint8Array;
   try {
-    bytes = rsDecodeWireBytes(allBytes.subarray(0, RS_ENCODED_BYTES), NSYM);
+    bytes = rsDecodeAll(allBytes.subarray(0, RS_ENCODED_BYTES), NSYM);
   } catch (err) {
     output.textContent =
       `Reed-Solomon decode failed: ${(err as Error).message}\n\n` +

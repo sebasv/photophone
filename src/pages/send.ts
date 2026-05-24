@@ -7,7 +7,7 @@ import {
   packetize,
   payloadCellCount,
   renderFrame,
-  rsEncodeWireBytes,
+  rsEncode,
   type SessionInfo,
 } from "../protocol";
 
@@ -20,7 +20,7 @@ import {
  * - "Start streaming" cycles through every packet of the payload at a
  *   fixed frame rate, looping indefinitely so a continuously-watching
  *   receiver can collect missing packets across multiple passes.
- * - Every wire packet is wrapped with `rsEncodeWireBytes(packet, NSYM)`
+ * - Every wire packet is RS-encoded via `rsEncode(packet, NSYM)` (no u16 length prefix — the wire packet self-describes via its `payload_len` header field, and the magic must remain at cell 0 for the orientation check)
  *   before going onto the cells, so a handful of cell-classification
  *   errors per frame can be corrected by the receiver. Without this the
  *   u32 `payload_offset` in the header gets corrupted by a single
@@ -56,10 +56,12 @@ const RS_BLOCKS = Math.floor(capacityBytes / 255);
 const RS_ENCODED_BYTES = RS_BLOCKS * 255;
 const RS_DATA_BYTES = RS_BLOCKS * (255 - NSYM);
 
-// `rsEncodeWireBytes` prepends a u16 length prefix inside the protected
-// region, so the actual wire packet (header + payload) we can fit per
-// frame is RS_DATA_BYTES minus that prefix.
-const maxWirePerFrame = RS_DATA_BYTES - 2;
+// `rsEncode` keeps the message bytes at the start of the encoded
+// stream (systematic encoding), so the wire packet's magic stays at
+// cell 0 where the rotation check expects it. The wire packet is
+// self-describing via its `payload_len` field; no external length
+// prefix needed.
+const maxWirePerFrame = RS_DATA_BYTES;
 const maxPayloadPerFrame = maxWirePerFrame - HEADER_SIZE;
 
 fileInput.addEventListener("change", async () => {
@@ -133,7 +135,7 @@ function stopStreaming(): void {
 }
 
 function renderWirePacket(wirePacket: Uint8Array): void {
-  const ecc = rsEncodeWireBytes(wirePacket, NSYM);
+  const ecc = rsEncode(wirePacket, NSYM);
   if (ecc.length > RS_ENCODED_BYTES) {
     status.textContent = `internal error: ECC produced ${ecc.length} bytes > ${RS_ENCODED_BYTES} frame budget`;
     return;
