@@ -3,8 +3,8 @@
  *
  * Each packet identifies itself by its **byte offset into the original
  * payload**, not by a sequence number. Same model TCP uses: the receiver
- * places each packet's bytes at the right slot of a pre-allocated buffer,
- * tracks received byte ranges as a sparse interval set, and reports gaps as
+ * places each packet's bytes at the right slot of a growing buffer, tracks
+ * received byte ranges as a sparse interval set, and reports gaps as
  * `{offset, length}` ranges.
  *
  * Why offsets instead of sequence numbers: link adaptation can change frame
@@ -13,7 +13,16 @@
  * byte range — which works automatically when packets address by offset.
  * If we instead used seq numbers, a single missing seq couldn't be split.
  *
- * Wire format (16-byte header, same total size as before):
+ * No total-payload-size field. The receiver allocates dynamically (doubling
+ * Uint8Array growth, amortized O(N)) and the user manually stops and saves
+ * when their progress display matches what they expect. Auto-complete and
+ * exact progress percentages will arrive with M11's back-channel or M12's
+ * handshake — until then, manual save is the parsimonious answer. Broadcast
+ * (M9) has its own termination signal: the fountain decoder peels until all
+ * K source packets are recovered, with K carried in the bootstrap metadata
+ * layer — unrelated to this header.
+ *
+ * Wire format (16-byte header):
  *
  *   offset 0  | 4 | magic "PHOT"
  *   offset 4  | 1 | version_major
@@ -22,10 +31,6 @@
  *   offset 10 | 4 | payload_offset (u32) — byte index into the payload
  *   offset 14 | 2 | payload_len (u16) — bytes in this packet
  *   offset 16 | N | payload
- *
- * Broadcast / fountain mode (M9+) will reinterpret `payload_offset` as a
- * fountain encoded-packet header (degree + PRNG seed), selected by the
- * frame's `mode` bit. The header field is otherwise identical.
  */
 
 export const MAGIC = new Uint8Array([0x50, 0x48, 0x4f, 0x54]); // "PHOT"
@@ -66,6 +71,11 @@ export function encodePacket(
   if (payloadOffset < 0 || payloadOffset > MAX_PAYLOAD_SIZE) {
     throw new Error(`payloadOffset out of range: ${payloadOffset}`);
   }
+  if (payloadOffset + payload.length > MAX_PAYLOAD_SIZE) {
+    throw new Error(
+      `packet exceeds protocol max payload: ${payloadOffset}+${payload.length} > ${MAX_PAYLOAD_SIZE}`,
+    );
+  }
 
   const wire = new Uint8Array(HEADER_SIZE + payload.length);
   wire.set(MAGIC, 0);
@@ -101,9 +111,7 @@ export function decodePacket(
 
 /**
  * Eager packetization: split the whole payload into fixed-size packets up
- * front. Useful for tests and for the static-config case. M12 (adaptation)
- * will add a streaming packetizer that produces one packet at a time sized
- * to the current frame's capacity.
+ * front.
  */
 export function packetize(
   payload: Uint8Array,
@@ -126,32 +134,33 @@ export function packetize(
 export type IngestResult =
   | "accepted"
   | "duplicate"
-  | "out-of-bounds"
   | "rejected-malformed"
   | "rejected-session"
   | "rejected-version";
 
 export interface ReassemblyState {
   session: SessionInfo;
-  /** Total payload size in bytes; from bootstrap metadata in production. */
-  payloadSize: number;
-  /** Pre-allocated receive buffer, sized to payloadSize. */
+  /**
+   * Dynamically-grown receive buffer. Capacity (.length) is always ≥
+   * highestByte, but the meaningful prefix ends at highestByte.
+   */
   buffer: Uint8Array;
+  /** One past the highest byte index any received packet has touched. */
+  highestByte: number;
   /** Contiguous received byte ranges, sorted by offset, non-overlapping. */
   received: ByteRange[];
 }
 
-export function newReassembly(
-  session: SessionInfo,
-  payloadSize: number,
-): ReassemblyState {
-  if (payloadSize < 0 || payloadSize > MAX_PAYLOAD_SIZE) {
-    throw new Error(`payloadSize out of range: ${payloadSize}`);
-  }
+/**
+ * Build a reassembly state for `session`. The buffer grows on demand as
+ * packets arrive; no upfront size is required because the protocol
+ * doesn't carry one.
+ */
+export function newReassembly(session: SessionInfo): ReassemblyState {
   return {
     session,
-    payloadSize,
-    buffer: new Uint8Array(payloadSize),
+    buffer: new Uint8Array(0),
+    highestByte: 0,
     received: [],
   };
 }
@@ -168,15 +177,23 @@ export function ingest(state: ReassemblyState, wire: Uint8Array): IngestResult {
   const payloadOffset = readU32BE(wire, 10);
   const payloadLen = readU16BE(wire, 14);
   if (wire.length < HEADER_SIZE + payloadLen) return "rejected-malformed";
-  if (payloadOffset + payloadLen > state.payloadSize) return "out-of-bounds";
+  if (payloadOffset + payloadLen > MAX_PAYLOAD_SIZE) return "rejected-malformed";
 
-  // Fully-covered incoming range → no-op duplicate.
   if (rangeIsCovered(state.received, payloadOffset, payloadLen)) {
     return "duplicate";
   }
 
-  // Copy bytes into the buffer. Re-copying overlapping bytes is fine —
-  // for a given session_id, those bytes are identical by construction.
+  // Grow the buffer (doubling) if the incoming bytes land past current capacity.
+  const required = payloadOffset + payloadLen;
+  if (required > state.buffer.length) {
+    let newCap = Math.max(state.buffer.length * 2, 256);
+    while (newCap < required) newCap *= 2;
+    const grown = new Uint8Array(newCap);
+    grown.set(state.buffer);
+    state.buffer = grown;
+  }
+  if (required > state.highestByte) state.highestByte = required;
+
   for (let i = 0; i < payloadLen; i++) {
     state.buffer[payloadOffset + i] = wire[HEADER_SIZE + i]!;
   }
@@ -184,16 +201,26 @@ export function ingest(state: ReassemblyState, wire: Uint8Array): IngestResult {
   return "accepted";
 }
 
+/**
+ * True when the received ranges form one contiguous run from offset 0 to
+ * `highestByte`. This is the strongest "complete" claim we can make
+ * without knowing the original payload size: every byte we've ever seen
+ * the address of, we now have.
+ */
 export function isComplete(state: ReassemblyState): boolean {
-  if (state.payloadSize === 0) return true;
+  if (state.highestByte === 0) return false;
   return (
     state.received.length === 1 &&
     state.received[0]!.offset === 0 &&
-    state.received[0]!.length === state.payloadSize
+    state.received[0]!.length === state.highestByte
   );
 }
 
-/** Gaps between received ranges, including any gap at the tail. */
+/**
+ * Gaps between received ranges, below `highestByte`. No tail gap is
+ * reported because the total payload size is unknown — any range past
+ * `highestByte` is invisible until a packet lands there.
+ */
 export function missing(state: ReassemblyState): ByteRange[] {
   const gaps: ByteRange[] = [];
   let cursor = 0;
@@ -203,20 +230,19 @@ export function missing(state: ReassemblyState): ByteRange[] {
     }
     cursor = r.offset + r.length;
   }
-  if (cursor < state.payloadSize) {
-    gaps.push({ offset: cursor, length: state.payloadSize - cursor });
-  }
   return gaps;
 }
 
+/**
+ * Return the contiguous prefix from offset 0. Throws if no packet at
+ * offset 0 has been received yet.
+ */
 export function reassemble(state: ReassemblyState): Uint8Array {
-  if (!isComplete(state)) {
-    const gaps = missing(state)
-      .map((g) => `[${g.offset}+${g.length}]`)
-      .join(", ");
-    throw new Error(`cannot reassemble: missing ranges ${gaps}`);
+  const first = state.received[0];
+  if (!first || first.offset !== 0) {
+    throw new Error("cannot reassemble: no contiguous prefix at offset 0");
   }
-  return state.buffer;
+  return state.buffer.slice(0, first.length);
 }
 
 // -- Interval set helpers -------------------------------------------------
