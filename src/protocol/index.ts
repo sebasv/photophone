@@ -19,3 +19,5 @@ export {
   recoverPayload,
 } from "./fountain";
 export * from "./backchannel";
+export * from "./fsk";
+export * from "./backchannel-audio";

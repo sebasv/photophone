@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0a0a0a" />
+    <title>Photophone · Audio back-channel transmit</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <main class="page page--send">
+      <header class="page__header">
+        <a href="/" class="back">← back</a>
+        <h1>Audio back-channel (transmit)</h1>
+      </header>
+      <p class="tagline">M11b standalone test page. Schedules FSK tones via Web Audio's OscillatorNode at the carrier frequencies and bit rate from <code>DEFAULT_FSK_PARAMS</code>. The receiver page's microphone decodes them.</p>
+      <section class="controls">
+        <label class="size-input">
+          <span>Message</span>
+          <input type="text" id="bc-message" value="hello back" />
+        </label>
+        <button id="bc-send">Send once</button>
+        <button id="bc-loop">Start loop</button>
+        <span id="status" class="status">idle</span>
+      </section>
+    </main>
+    <script type="module" src="/src/pages/audio-bc-tx.ts"></script>
+  </body>
+</html>
