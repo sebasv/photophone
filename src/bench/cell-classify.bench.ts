@@ -42,3 +42,14 @@ describe("warped frame decode (fiducial detection + homography + sample)", () =>
     decodeFrameWarped(DEFAULT_GEOMETRY, PALETTE_2BIT, frame, CELL_SIZE_PX);
   });
 });
+
+import { decodeFrameWarpedStateful, newWarpedDecoderState } from "../protocol";
+
+describe("warped frame decode — stateful (warm cache)", () => {
+  const state = newWarpedDecoderState();
+  // Warm the cache before benchmarking the fast path.
+  decodeFrameWarpedStateful(DEFAULT_GEOMETRY, PALETTE_2BIT, frame, CELL_SIZE_PX, state);
+  bench("decodeFrameWarpedStateful() — warm cache, magic still matches", () => {
+    decodeFrameWarpedStateful(DEFAULT_GEOMETRY, PALETTE_2BIT, frame, CELL_SIZE_PX, state);
+  });
+});
