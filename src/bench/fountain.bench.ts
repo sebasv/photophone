@@ -13,7 +13,8 @@ for (let i = 0; i < K; i++) {
   for (let j = 0; j < S; j++) buf[j] = (i * 13 + j) & 0xff;
   sources.push(buf);
 }
-const packets = [];
+import type { EncodedPacket } from "../protocol";
+const packets: EncodedPacket[] = [];
 for (let f = 0; f < K * 2; f++) {
   packets.push(encodeOnePacket(sources, 1 + (f % 5), (0x1234 + f) >>> 0));
 }

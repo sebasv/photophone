@@ -191,16 +191,40 @@ function fillRect(
   }
 }
 
+/**
+ * M14 — pure black/white render of the config strip so a worst-case
+ * decoder (single luminance threshold) can read it reliably even when
+ * the rest of the frame is at the edge of usability. Bit 0 → black,
+ * bit 1 → white. Kept distinct from the palette colours so the
+ * decoder doesn't need to know which palette is in effect to read
+ * the strip — that's exactly the chicken-and-egg the config strip
+ * resolves.
+ */
+const CONFIG_BIT_LOW_RGB: readonly [number, number, number] = [0, 0, 0];
+const CONFIG_BIT_HIGH_RGB: readonly [number, number, number] = [255, 255, 255];
+
 export function renderFrame(
   g: FrameGeometry,
   palette: Palette,
   payloadCells: Uint8Array,
   cellSizePx: number,
+  /**
+   * Optional 16-bit config strip content (M14). If provided, must be the
+   * exact `g.configWidth × 1`-cell shape encoded as 2 bytes via
+   * `configBitsToCellArray` (16 bits, LSB-first within each byte). When
+   * omitted, config cells fall back to the legacy palette[0] placeholder.
+   */
+  configBits?: Uint8Array,
 ): RawImage {
   const expected = payloadCellCount(g);
   if (payloadCells.length !== expected) {
     throw new Error(
       `renderFrame: payloadCells.length=${payloadCells.length}, expected ${expected}`,
+    );
+  }
+  if (configBits !== undefined && configBits.length !== 2) {
+    throw new Error(
+      `renderFrame: configBits.length=${configBits.length}, expected 2 (16 bits)`,
     );
   }
   const width = frameWidthPx(g, cellSizePx);
@@ -226,7 +250,14 @@ export function renderFrame(
               : palette.colors[0]!;
           break;
         case "config":
-          rgb = palette.colors[0]!;
+          if (configBits) {
+            const bitIdx = cx - g.configColStart; // 0..g.configWidth-1
+            const byte = configBits[bitIdx >> 3] ?? 0;
+            const bit = (byte >> (bitIdx & 7)) & 1;
+            rgb = bit ? CONFIG_BIT_HIGH_RGB : CONFIG_BIT_LOW_RGB;
+          } else {
+            rgb = palette.colors[0]!;
+          }
           break;
         case "calibration":
           rgb = palette.colors[cx % palette.colors.length]!;
@@ -236,6 +267,69 @@ export function renderFrame(
     }
   }
   return img;
+}
+
+/**
+ * Sample the 16-bit config strip from a warped image given the rotation
+ * homography. Uses pure luminance thresholding (mean-of-strip as the
+ * threshold) — independent of palette so it can be read *before* the
+ * palette is learned, which is the whole point of having a dedicated
+ * config region.
+ *
+ * Returns 2 bytes ready for `decodeFrameConfigBits()`.
+ */
+export function sampleConfigStripLuminance(
+  g: FrameGeometry,
+  img: RawImage,
+  h: Homography,
+  cellSizePx: number,
+): Uint8Array {
+  if (g.configWidth !== 16) {
+    throw new Error(
+      `sampleConfigStripLuminance: only g.configWidth=16 is supported (got ${g.configWidth})`,
+    );
+  }
+  const half = cellSizePx / 2;
+  const luminances = new Float32Array(g.configWidth);
+  for (let i = 0; i < g.configWidth; i++) {
+    const cx = g.configColStart + i;
+    const cy = g.configRow;
+    const warped = applyHomography(h, {
+      x: cx * cellSizePx + half,
+      y: cy * cellSizePx + half,
+    });
+    const px = Math.round(warped.x);
+    const py = Math.round(warped.y);
+    if (px < 0 || py < 0 || px >= img.width || py >= img.height) {
+      luminances[i] = 0;
+      continue;
+    }
+    const o = (py * img.width + px) * 4;
+    // Rec. 709 luma — works fine for binarization.
+    luminances[i] =
+      0.2126 * img.data[o]! + 0.7152 * img.data[o + 1]! + 0.0722 * img.data[o + 2]!;
+  }
+  // Threshold strategy: if the strip has meaningful contrast (max-min > 40
+  // luma steps), split at the midpoint between max and min so it adapts to
+  // camera exposure. If the strip is uniform (all-zeros or all-ones config
+  // bits → all black or all white), pick a fixed threshold of 128 so the
+  // uniform case decodes correctly to its actual content.
+  let lumMin = Infinity;
+  let lumMax = -Infinity;
+  for (let i = 0; i < g.configWidth; i++) {
+    const v = luminances[i]!;
+    if (v < lumMin) lumMin = v;
+    if (v > lumMax) lumMax = v;
+  }
+  const threshold = lumMax - lumMin > 40 ? (lumMin + lumMax) / 2 : 128;
+  const out = new Uint8Array(2);
+  for (let i = 0; i < g.configWidth; i++) {
+    if (luminances[i]! > threshold) {
+      const bytePos = i >> 3;
+      out[bytePos] = (out[bytePos]! | (1 << (i & 7))) & 0xff;
+    }
+  }
+  return out;
 }
 
 /**
