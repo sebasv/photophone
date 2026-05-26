@@ -154,6 +154,16 @@ function renderWirePacket(wirePacket: Uint8Array): void {
   // the cells they encode) are inert.
   const framePayload = new Uint8Array(capacityBytes);
   framePayload.set(ecc);
+  // Cosmetic only: the tail past RS_ENCODED_BYTES is ignored by the
+  // receiver (it subarrays the ECC region before decoding), but
+  // zero-init leaves it as `palette[0]` = black cells, which lands as
+  // a full-width black strip across the bottom of the rendered frame
+  // because the last payload-cell positions are in the bottom rows.
+  // Fill with a deterministic non-zero pattern so the bottom of the
+  // frame looks like the rest — pure cosmetics, no protocol impact.
+  for (let i = ecc.length; i < framePayload.length; i++) {
+    framePayload[i] = (i * 31 + 7) & 0xff;
+  }
   const cells = bytesToCells(framePayload, PALETTE_2BIT);
   const img = renderFrame(DEFAULT_GEOMETRY, PALETTE_2BIT, cells, CELL_SIZE_PX);
   canvas.width = img.width;
