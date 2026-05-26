@@ -34,25 +34,21 @@ full-frame fallback to a cheap window scan.
 ## Algorithm sketch
 
 ```
-detectFiducialsInWindows(img, cachedFiducials, cachedOtsu, cachedFiducialSizePx):
-  # Window radius scales with the fiducial size — closer camera = bigger
-  # fiducials on screen + bigger jumps between frames. 1× the fiducial
-  # side length is a sensible default; it permits ~one-fiducial-width
-  # of motion per frame, which is way more than typical hand wobble.
-  windowRadius = cachedFiducialSizePx
+WINDOW_RADIUS_PX = 50  # fixed; see "Decisions" below
 
+detectFiducialsInWindows(img, cachedFiducials, cachedOtsu):
   # Reuse the cached full-image Otsu threshold from the last full
   # detect. We do NOT recompute Otsu per window: (a) it's wasteful on
-  # 64×64 pixel patches, (b) any failed decode bounces us straight to
+  # 100×100 pixel patches, (b) any failed decode bounces us straight to
   # a full-image re-detect that refreshes the threshold for free, so
   # the cached value is at most one failed-decode-cycle stale.
   threshold = cachedOtsu
 
   for each corner in (tl, tr, br, bl):
-    roiX = clamp(cachedFiducials[corner].x - windowRadius, 0, img.width)
-    roiY = clamp(cachedFiducials[corner].y - windowRadius, 0, img.height)
-    roiW = clamp(cachedFiducials[corner].x + windowRadius, 0, img.width) - roiX
-    roiH = clamp(cachedFiducials[corner].y + windowRadius, 0, img.height) - roiY
+    roiX = clamp(cachedFiducials[corner].x - WINDOW_RADIUS_PX, 0, img.width)
+    roiY = clamp(cachedFiducials[corner].y - WINDOW_RADIUS_PX, 0, img.height)
+    roiW = clamp(cachedFiducials[corner].x + WINDOW_RADIUS_PX, 0, img.width) - roiX
+    roiH = clamp(cachedFiducials[corner].y + WINDOW_RADIUS_PX, 0, img.height) - roiY
 
     # Connected components ONLY within the ROI. The current
     # findComponents scans the whole image; we add a sibling version
@@ -77,42 +73,49 @@ flood-fill / two-pass labeling to pixels inside `(roiX, roiY, roiX+roiW,
 roiY+roiH)`. Everything else (ratio match, cross-section) already
 exists and works on arbitrary pixel sets.
 
-**`cachedFiducialSizePx`** is estimated from the cached corner
-quadrilateral and the geometry — the canvas spans `g.cellsX` cells on a
-side, the fiducial spans `g.fiducialSize` cells, so:
+**Why fixed, not fiducial-relative.** Per-frame pixel motion is roughly
+distance-independent in absolute pixels — rotational hand wobble at a
+constant angular rate produces the same number of pixels of fiducial
+movement regardless of how far the camera is from the screen. A
+fiducial-relative window would shrink as the camera pulls back (when
+fiducials get smaller on the image), which is exactly when the search
+needs more headroom, not less. Going with a fixed window that's
+comfortably larger than realistic jitter at any distance.
 
-```
-sidePx = mean(|cachedFiducials.tl - cachedFiducials.tr|,
-              |cachedFiducials.tr - cachedFiducials.br|, …)
-cachedFiducialSizePx = sidePx * (g.fiducialSize / g.cellsX)
-```
-
-This auto-scales: closer camera → larger fiducials on screen → larger
-search window, exactly matching how fast pixels move per frame.
+100×100 px windows over four corners = ~40 000 pixels of work per
+frame. A FHD frame is 1920×1080 = ~2 M pixels, so this is roughly
+50× cheaper than a full-frame pass — and the existing Otsu cost on
+that full frame is what currently dominates the warped decode at
+~14 ms / frame.
 
 ## State additions to `WarpedDecoderState`
 
-To support the window search, the decoder state grows two fields:
+To support the window search, the decoder state grows one field:
 
 ```ts
 interface WarpedDecoderState {
   lastFiducials: [Point, Point, Point, Point] | null;
   lastRotation: number;
   lastOtsuThreshold: number;       // NEW — captured on every full detect
-  lastFiducialSizePx: number;      // NEW — derived from lastFiducials + g
   // ... existing stats counters
 }
 ```
 
-Both are populated whenever `decodeFrameWarpedStateful` completes the
-slow path successfully, alongside `lastFiducials` and `lastRotation`.
+Populated whenever `decodeFrameWarpedStateful` completes the slow path
+successfully, alongside `lastFiducials` and `lastRotation`. The
+threshold is shared across all four window scans on the next frame —
+all four PDPs live on the same screen under the same lighting, so a
+single threshold value is right.
 
 ## Decisions
 
-1. **Window radius — adaptive to fiducial size.** Use `1 × cachedFiducialSizePx`
-   (derived from the cached corner quad and the geometry, see above).
-   Auto-scales with camera distance and is comfortably larger than
-   per-frame hand wobble at any realistic fps.
+1. **Window radius — fixed 50 px.** Per-frame pixel motion is dominated
+   by rotational hand wobble, which is roughly constant in absolute
+   pixels independent of camera distance. A fiducial-relative window
+   would shrink at distance — exactly when fiducials are smaller, jitter
+   relative to the fiducial is larger, and the search needs more
+   headroom not less. 50 px covers any realistic per-frame motion and
+   keeps the work at ~2 % of a FHD full-frame pass.
 
 2. **Otsu threshold — cached, not recomputed per window.** Reuse
    `state.lastOtsuThreshold` from the last full detect. A failed decode
@@ -157,13 +160,13 @@ This branch adds:
 ## Implementation sequencing
 
 1. PR #32 merged — cached-fiducials fast path lives.
-2. Extend `WarpedDecoderState` with `lastOtsuThreshold` and
-   `lastFiducialSizePx`. Capture both from the slow-path `detectFiducials`
-   on success.
+2. Extend `WarpedDecoderState` with `lastOtsuThreshold`. Capture from
+   the slow-path `detectFiducials` on success.
 3. Add `findComponentsInROI(img, predicate, roi)` (~50 lines, parallel to
    existing `findComponents`).
-4. Add `detectFiducialsInWindows(img, cached, cachedOtsu, fiducialSizePx)`
-   using `findComponentsInROI` + the existing `verifyCrossSection`.
+4. Add `detectFiducialsInWindows(img, cached, cachedOtsu)` (fixed 50 px
+   window radius) using `findComponentsInROI` + the existing
+   `verifyCrossSection`.
 5. Wire it as the middle tier in `decodeFrameWarpedStateful`:
      fast path (cached fiducials, cached rotation, magic check)
        → window search (this PR)
