@@ -294,150 +294,56 @@ A note on ordering: the forward-only unicast pipeline (M1–M8) is *almost* broa
 - TypeScript + Vite + PWA, three pages, protocol stubs, MIT-licensed.
 - **Done when:** `pnpm build` is green.
 
-### M1 — Single-frame pristine loopback
+### M1 — Single-frame pristine loopback ✅
 - Implement `codec.bytesToCells` and `codec.cellsToBytes` for the 4-colour palette.
 - Implement a minimal `renderFrame(cells) → ImageData` and `decodeFrame(ImageData) → cells`. No fiducials, no perspective, no ECC.
 - Include the **config-indicator** region in the frame format from the start, even though its contents are static at this stage. Hard to retrofit later, trivial to add now.
 - **Done when:** a unit test round-trips a random 800-byte buffer through `encode → render → decode → decode-cells` and gets the same bytes back, byte-perfect.
 
-### M2 — Multi-frame pristine loopback
+### M2 — Multi-frame pristine loopback ✅
 - Implement `transport.packetize` and `transport.reassemble`, including the packet header.
 - Send a multi-packet payload end-to-end in memory (no rendering yet).
 - **Done when:** a unit test packetizes `hello_world.png`, shuffles the packet order, drops a few, reorders them, and reassembles correctly *when* enough packets are present; cleanly reports missing seq numbers otherwise.
 
-### M3 — Fiducials & perspective unwarp
+### M3 — Fiducials & perspective unwarp ✅
 - Render fiducial markers; implement detection and a homography solve to remap a skewed/rotated frame to canonical cell coordinates.
 - Decode the config indicator first (worst-case parameters), then the rest of the frame.
 - **Done when:** the receiver decodes a frame that's been programmatically rotated, scaled, and perspective-warped (still synthetic, no camera) without errors.
 
-### M3.5 — Robust fiducial detection
-**Motivation — three failures discovered during M4 manual testing:**
+### M3.5 — Robust fiducial detection ✅
 
-1. **Lighting brittleness.** The detector uses `r > 200 && g > 200 && b > 200`. That threshold was tuned for an indoor scene where the camera's auto-exposure metered against a dark room. Outside in daylight the camera meters against bright surroundings, gain drops, and the actual fiducial pixels come back at maybe `(180, 180, 195)` — silently failing the threshold even though nothing about the fiducial itself changed.
+Pivot from the original 4×4 ring marker to QR-style detection: Otsu adaptive thresholding + 7×7 Position Detection Patterns with a 1:1:3:1:1 cross-section verifier + magic-validated rotation recovery. Motivation, three-failure write-up, rejected alternatives, and deferred refinements live in [FIDUCIAL-DETECTION.md](./FIDUCIAL-DETECTION.md) — moved out of this doc to keep the milestone list scannable. [INCREMENTAL-DETECTION.md](./INCREMENTAL-DETECTION.md) describes the cached-fiducial / window-search fast paths layered on top of this cold-path detector.
 
-2. **False positives from arbitrary bright shapes.** Any blob over the threshold that survives the size filter is a candidate. White letters on the sender page (`#f5f5f5` until the PR #8 fix), a laptop bezel under outdoor light, paper in the frame — all can pass. When such a blob sits closer to an image corner than a real fiducial, it wins the corner-assignment heuristic and the homography lands sampling off-frame.
+**Done when:** a single PNG decodes correctly across dim/daylight/mixed lighting and all four cardinal orientations, the laptop bezel doesn't win corner assignment, and the synthetic-warp tests in `framing.test.ts` still pass.
 
-3. **Orientation.** `detectFiducials` assigns blobs to corners by Manhattan distance to *image* corners, which is rotation-blind: rotate the camera 180° and the receiver labels what was the sender's TL as BR, so cells decode back-to-front.
-
-**Why not "just add a quiet zone" around each fiducial?** Letters on a dark page already have black around them; surrounding margin is visually identical to a fiducial's outer ring. Whitespace separates content from noise but doesn't *characterise* fiducial-ness. The fix has to constrain the marker's shape, not its surroundings.
-
-**Approach — pivot to QR-style detection.** Two changes together; orientation strategy still TBD (see "Open: orientation strategy" below).
-
-#### 1. Otsu's adaptive thresholding
-
-Replace the constant `>200` with a per-frame threshold derived from the image's brightness histogram. Otsu picks the threshold that maximises the between-class variance of "dark vs. bright" pixels — i.e., the value that best separates foreground from background in *this specific* frame. No magic constants survive across lighting conditions.
-
-- Compute a 256-bin luminance histogram of the camera frame
-- Walk the threshold from 1..254, keep the value that maximises `w_dark · w_bright · (μ_bright − μ_dark)²`
-- Use that threshold (and a tolerance band) as the marker-pixel test
-
-Independent of fiducial shape. Solves the outdoor/indoor problem. ~80 lines, no dependencies, well-documented algorithm.
-
-#### 2. 7×7 Position Detection Patterns (PDPs) at all four corners
-
-Replace the 4×4 "outer ring + 2×2 inner marker" fiducial with a 7×7 nested-ring pattern that mirrors QR codes' finder pattern:
-
-```
-■ ■ ■ ■ ■ ■ ■
-■ □ □ □ □ □ ■
-■ □ ■ ■ ■ □ ■
-■ □ ■ ■ ■ □ ■
-■ □ ■ ■ ■ □ ■
-■ □ □ □ □ □ ■
-■ ■ ■ ■ ■ ■ ■
-```
-
-The signature property: any horizontal or vertical line through the centre crosses five bands in **1:1:3:1:1** width ratio (`black:white:black:white:black`). The detector scans rows then columns looking for run-length sequences matching that ratio within a width tolerance; two independent confirmations (one row, one column) per pattern, four patterns per frame.
-
-Why this is dramatically more robust than the current 4×4 detector:
-
-- **The ratio is overwhelmingly improbable in nature.** A bezel, a letter, a reflection — none have a sharp dark ring around a bright ring around a dark centre with the right proportions. Bezels would have width ratios like `1:0.5:100:0.5:1` (the bright screen content fills most of the line) and fail.
-- **No separate "anti-bezel" or "anti-letter" checks needed.** The ratio test alone subsumes them.
-- **Decades of empirical hardening.** Every corner case has already been found and fixed in published implementations.
-
-**Cost:** 7×7 = 49 cells per fiducial × 4 corners = 196 cells, up from 64 today. Net payload impact: **−132 cells = −3.4%**. Acceptable; the robustness payoff justifies it.
-
-#### 3. Orientation via magic validation in all four rotations
-
-All four PDPs render identically; orientation is recovered *after* detection. For each of the four rotational assignments of the detected PDP centroids to the canonical TL/TR/BR/BL slots, compute the homography, sample the first 16 payload cells (= 4 bytes), and accept the rotation whose magic decodes to `"PHOT"` (`0x50 0x48 0x4F 0x54`).
-
-Properties:
-
-- **Zero rendered-frame asymmetry.** All four PDPs are pixel-identical; the orientation signal lives in the already-required packet header, not in the fiducial pattern.
-- **False-positive probability ≈ 2⁻³² per non-matching rotation.** Three non-matching rotations × 2⁻³² ≈ 1 in 1.4 billion that a wrong rotation accidentally decodes to the magic. Effectively never happens.
-- **Cost is negligible:** 4 × (8×8 linear solve + 16-cell sample + 4-byte assembly). Microseconds.
-- **Loose coupling.** No dependence on render-layout asymmetry, satellite markers, or fiducial-pattern variants. Changes to the palette, frame size, or fiducial geometry all leave the orientation logic untouched.
-
-The detector's output carries an `orientation: 0 | 1 | 2 | 3` field so M4.5's diagnostics overlay can surface which rotation was accepted and which magic bytes the other three rotations produced.
-
-Rejected alternatives:
-
-- **Satellite marker beside the TL fiducial.** Adds a new render artefact, a separate detector path, and its own false-positive surface. Weaker math than the magic's 32 bits of entropy.
-- **QR-style asymmetric TL fiducial (3+1).** Forces two PDP detector paths and necessarily weakens the TL pattern's ratio match by deviating from 1:1:3:1:1.
-- **CRC32 in the bootstrap region instead of the magic.** Equivalent entropy (32 bits) but depends on M9's bootstrap parser; the magic check already exists in the decode pipeline.
-
-#### 4. Geometry plausibility sanity check (optional, low effort)
-
-After detection, verify the four chosen PDP centroids form a roughly-convex quadrilateral with reasonable aspect ratio (say 0.5–2.0) and reasonable image-area fraction (e.g. 5%–80%). Cheap to add (~30 lines) and catches the residual edge cases where four valid PDP-passing patches are arranged implausibly. Skip if the PDP detector alone proves robust enough in practice.
-
-#### 5. Deferred refinements
-
-Two detector ideas considered but not shipped in M3.5. Logged here with a "pick up when…" trigger so the deferral is explicit and the reasoning is preserved for whoever revisits this section.
-
-##### a. Staggered topology / outer-band area ratio
-
-**Idea.** Extend the area-ratio check to a third layer. Currently we verify `D_inner ⊂ W_ring` with `W/D ≈ 16/9`. The natural extension is to verify an *outer dark band* immediately around `W_ring` with thickness ≈ 1/3 of the centre. Done as area ratios it is **projectively invariant** — strictly more perspective-robust than the 1:1:3:1:1 cross-section we landed in §8 M3.5 #3.
-
-**Why deferred.** The cross-section verifier is already cheap (~30 ops worst case per candidate) and effective on the failure modes M4.5 surfaced. The staggered outer-band check needs morphological dilation around each candidate's `W_ring` to isolate the immediate annulus from the page-background connected component — another full pixel pass per candidate. For typical handheld camera angles, the cross-section's perspective sensitivity is well within tolerance.
-
-**Pick up when:**
-- Manual testing reveals false-positive leaks under extreme perspective (camera approaching screen-edge-on), where cross-section starts failing under heavy band-width distortion.
-- Or: a structural false positive emerges in the wild that passes both flood-fill containment *and* cross-section verification.
-
-##### b. Locality-restructured detector (one flood-fill instead of two)
-
-**Idea.** Currently `detectPDPs` runs `findComponents` twice — once for whites, once for darks. Restructure to: flood-fill *only* dark components, then per-candidate localised expansion to find each candidate's surrounding white ring (sampling pixels in the annulus just outside the dark's bbox, rather than committing the whole image's white pixels to a connected-components pass).
-
-**Why deferred.** Detection is currently well under budget (<5ms total on a 1080p frame; the connected-components passes are ~2ms each). This refactor would save ~2ms — a real number, but optimisation isn't a problem yet. The current structure is also more obviously correct under inspection; locality changes invite bugs.
-
-**Pick up when:**
-- Profiling shows detection in the hot loop dominating frame time (>15ms on real hardware).
-- Or: M6 (continuous capture) demands a frame budget the current detector can't meet.
-
-**Done when:**
-- A single PNG decodes correctly under all of: dim indoor light, outdoor daylight, mixed lighting, and the camera held at any of the four cardinal orientations.
-- A wider camera view that includes the laptop bezel still decodes correctly — the bezel does not win corner assignment.
-- No manual covering of sender-page UI required.
-- Synthetic-warp tests still pass (rotated inputs to `decodeFrameWarped`).
-
-### M4 — First camera capture
+### M4 — First camera capture ✅
 - Receiver page: snap a still frame from `getUserMedia`, decode it.
 - **Done when:** a user can point their laptop camera at a phone displaying a Photophone frame, hit "capture", and see the decoded bytes. Holds still, one frame at a time.
 
-### M5 — Colour calibration strip
+### M5 — Colour calibration strip ✅
 - Sender embeds the palette in the calibration strip every frame.
 - Receiver fits a per-frame colour classifier (nearest-neighbour in some colour space) from the calibration cells before classifying payload cells.
 - **Done when:** M4 still works under three lighting conditions (warm room, cool room, mixed).
 
-### M6 — Continuous capture
+### M6 — Continuous capture ✅
 - Move the decode pipeline into the worker. Process frames at camera rate.
 - Implement seq-based deduplication so a frame seen multiple times doesn't count multiple times.
 - **Done when:** the receiver streams from the camera and reassembles a multi-packet payload from a continuously-rendered sender, without manual capture clicks.
 
-### M7 — Reed-Solomon ECC
+### M7 — Reed-Solomon ECC ✅
 - Wire `ecc.encode` / `ecc.decode` (start with `reed-solomon-erasure` or an inline TS implementation; move to Rust/WASM only if measured-slow).
 - **Done when:** transmission still succeeds when the sender is positioned at an awkward angle / partially shadowed, where ~10% of cells classify incorrectly per frame.
 
-### M8 — First end-to-end unicast PNG transfer 🎯
+### M8 — First end-to-end unicast PNG transfer 🎯 ✅
 - Bring it together: sender picks `hello_world.png`, receiver saves the decoded bytes as a file, opens it, it renders identical to the original. Forward-only, no back-channel yet.
 - **Done when:** sha256 of the received bytes equals sha256 of the sent bytes, for `hello_world.png`.
 
-### M9 — Fountain coding (outer code)
+### M9 — Fountain coding (outer code) ✅
 - Replace "cycle through source packets in order" with "emit an unbounded stream of LT-coded encoded packets". Each encoded packet carries a small degree-list header so the decoder knows which sources it combines.
 - Decoder collects encoded packets and reconstructs once it has enough (Gaussian elimination is fine for the packet counts we're dealing with; switch to belief-propagation peeling if it becomes a bottleneck).
 - **Done when:** kill the receiver mid-transfer at the 50% mark, restart it from scratch; with the sender still running, it reconstructs the full payload from the encoded packets it sees after restart.
 
-### M10 — Broadcast mode 🎯
+### M10 — Broadcast mode 🎯 ✅
 - Embed bootstrap metadata (session ID, source count, payload size, filename, mime, sha256) in every frame.
 - Sender uses conservative defaults (larger cells, smallest palette, slow fps) because there's no negotiation.
 - New sender UI mode: "broadcast" — picks a file, shows a session info banner, loops fountain-encoded frames indefinitely.
@@ -445,34 +351,36 @@ Two detector ideas considered but not shipped in M3.5. Logged here with a "pick 
 - **This is also where Photophone formally becomes a *file* transfer rather than a *byte stream*** — the receiver reads the bootstrap mime/filename and saves the result with the correct name and extension, regardless of payload type (see §9.2).
 - **Done when:** open two receiver windows that start at different times during a single broadcast; both reconstruct the file successfully without coordinating, save it with the correct name and extension, and verify the sha256 transmitted in the bootstrap. Verified with at least two payload types (a PNG and a non-image binary, e.g. a small PDF or text file) to confirm the any-binary path.
 
-### M11 — Receiver→sender back-channel (visual ACK channel)
+### M11 — Receiver→sender back-channel (visual ACK channel) ✅
 - Receiver page can render a small dedicated channel frame (lower fps, larger cells acceptable) on its own screen.
 - Sender page can open its own camera, find this channel, and decode it.
 - This is shared infrastructure for M12, M13, M14 — get it solid before layering features.
 - M11b is a planned alternative back-channel modality (audio via FSK over Web Audio) — see §6.1. Same interface, different physical channel; M12–M14 don't care which is wired up.
 - **Done when:** a manually-crafted "hello back" message displayed by the receiver is decoded by the sender's camera within 2 seconds.
 
-### M12 — Handshake-time link negotiation (static adaptation)
+### M12 — Handshake-time link negotiation (static adaptation) ✅
 - Receiver displays a one-shot capabilities frame on its own screen: max resolvable cell size, preferred grid dimensions, sustainable fps, comfortable palette size.
 - Sender reads it once, picks transmission parameters, configures the encoder. Parameters stay static for the duration.
 - **Done when:** point the receiver at the sender from 30 cm and from 2 m — the sender visibly picks different cell sizes for each, and the transfer completes in both cases.
 
-### M13 — Bidirectional ARQ
+### M13 — Bidirectional ARQ ✅
 - Receiver renders ACK/NACK frames continuously over the back-channel.
 - Sender drops acked source packets from its fountain encoding pool (or, in non-fountain mode, from its rotation) and prioritizes nacked ones.
 - **Done when:** payload completes faster than the M9 broadcast baseline for the same input, and recovers cleanly when we deliberately obstruct the channel mid-transfer.
 
-### M14 — Continuous link adaptation (dynamic)
+### M14 — Continuous link adaptation (dynamic) ✅
 - Receiver continuously reports decode-quality stats (cell-classification confidence, observed FER) over the back-channel.
 - Sender runs a control loop: bump rate/density when error rate is low, back off when high.
 - The config indicator at the top of each frame tells the receiver which decoder parameters to apply, so changes mid-stream don't break anything.
 - **Done when:** start a transfer with the camera close; slowly walk it away mid-transfer until just before the edge of usability; the sender visibly reduces density to keep decoding working, and the transfer completes.
 
-### M15 — Performance pass
+### M15 — Performance pass 🚧
 - Profile. Likely culprits in order: cell classification, fiducial detection, fountain decode.
 - Move the per-pixel kernel to WebGL2 fragment shaders.
 - Move fountain/RS decode to Rust → WASM if it shows up in the profile.
 - **Done when:** end-to-end throughput on a stock laptop+phone setup is at least 4× M8's baseline.
+
+**Status.** Baseline measurements + first wins have shipped (palette-LUT classifier, cached-fiducial fast path, window-search design draft). See [PERFORMANCE.md](./PERFORMANCE.md) for current bench numbers and [INCREMENTAL-DETECTION.md](./INCREMENTAL-DETECTION.md) for the incremental detector design. WebGL2 / WASM work remains — the 4× target isn't met yet.
 
 ## 9. Test corpus
 
