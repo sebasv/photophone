@@ -2,14 +2,17 @@
  * Browser glue for the M11b audio back-channel.
  *
  * Two surfaces:
- *   - `startAudioBackchannelListener` opens the mic, polls Goertzel filters
- *     at the bit rate, slides over recent bits looking for an FSK frame,
- *     and fires a callback per decoded BackChannelMessage.
+ *   - `startAudioBackchannelListener` opens the mic, runs an AudioWorklet
+ *     processor that emits per-bit Goertzel power measurements in lockstep
+ *     with the audio clock, applies the carrier-detect gate on the main
+ *     thread, slides over recovered bits looking for an FSK frame, and
+ *     fires a callback per decoded BackChannelMessage.
  *   - `transmitAudioBackchannelMessage` schedules OscillatorNode frequency
  *     changes for one back-channel frame.
  *
  * Kept here (not in `src/protocol/`) because both depend on browser-only
- * APIs (AudioContext, MediaStream). The protocol layer stays node-testable.
+ * APIs (AudioContext, MediaStream, AudioWorklet). The protocol layer
+ * (including the gate logic via `applyDemodGate`) stays node-testable.
  *
  * Used by:
  *   - send.ts        (visual sender, listens for back-channel)
@@ -21,17 +24,22 @@
 import {
   DEFAULT_DEMOD_GATE,
   DEFAULT_FSK_PARAMS,
+  applyDemodGate,
   audioBackChannelDecode,
   audioBackChannelEncode,
   bitsToBytes,
   bytesToBits,
-  demodBitGated,
   fskUnframe,
   type BackChannelMessage,
   type DemodGateParams,
   type FskParams,
   type SessionInfo,
 } from "../protocol";
+
+// Vite recognizes `new URL('./file.js', import.meta.url)` and bundles the
+// referenced file as a separate asset. The resulting URL is suitable for
+// AudioWorklet.addModule().
+const workletUrl = new URL("./audio-bc-worklet.js", import.meta.url);
 
 export interface DecodedBackchannelFrame {
   msg: BackChannelMessage;
@@ -62,7 +70,9 @@ export interface ListenerDiagnostics {
   noiseFloor: number;
   /** SNR estimate: max(powerLow, powerHigh) / noiseFloor. */
   snr: number;
-  /** True if SNR + absolute-min thresholds both pass. */
+  /** Tone-pair coherence: max(powerLow, powerHigh) / min(powerLow, powerHigh). */
+  coherence: number;
+  /** True if SNR, coherence, and absolute-min thresholds all pass. */
   hasCarrier: boolean;
   /** Control-frequency Hz values used for the noise-floor estimate. */
   controlHz: ReadonlyArray<number>;
@@ -84,14 +94,17 @@ export interface ListenerOptions {
 }
 
 /**
- * Open the microphone and start decoding FSK back-channel frames. Returns
- * a handle the caller can later stop. Resolves once the stream + analyser
- * are wired up; rejects if `getUserMedia` fails.
+ * Open the microphone and start decoding FSK back-channel frames using an
+ * AudioWorkletProcessor for sample-accurate bit-clock timing (no
+ * setInterval drift, no AnalyserNode polling). Resolves once the stream +
+ * worklet are wired up; rejects if `getUserMedia` or the worklet load
+ * fails.
  */
 export async function startAudioBackchannelListener(
   opts: ListenerOptions,
 ): Promise<ListenerHandle> {
   const fsk = opts.fsk ?? DEFAULT_FSK_PARAMS;
+  const gate = opts.gate ?? DEFAULT_DEMOD_GATE;
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
       echoCancellation: false,
@@ -104,50 +117,69 @@ export async function startAudioBackchannelListener(
   // Safari (and Safari iOS in particular) often leaves the context
   // suspended after an awaited getUserMedia, because the original button-
   // click gesture token doesn't survive the await. With a suspended
-  // context, AnalyserNode sees no samples and the listener silently
+  // context, the worklet receives no samples and the listener silently
   // captures zeros forever. Resume explicitly.
   if (audioCtx.state === "suspended") await audioCtx.resume();
+  await audioCtx.audioWorklet.addModule(workletUrl);
   const src = audioCtx.createMediaStreamSource(stream);
   const sampleRate = audioCtx.sampleRate;
   const samplesPerBit = Math.round(fsk.bitDurationSec * sampleRate);
-  const analyser = audioCtx.createAnalyser();
-  analyser.fftSize = nearestPow2(samplesPerBit * 2);
-  src.connect(analyser);
-  const timeBuf = new Float32Array(analyser.fftSize);
+  const node = new AudioWorkletNode(audioCtx, "bc-demod", {
+    processorOptions: {
+      samplesPerBit,
+      markLowHz: fsk.markLowHz,
+      markHighHz: fsk.markHighHz,
+      controlHz: [...gate.controlHz],
+      oversample: 1,
+    },
+  });
+  src.connect(node);
+  // No connect to destination — we don't want to play the mic input back.
   const bitBuffer: number[] = [];
   const startedAt = performance.now();
-  const intervalMs = fsk.bitDurationSec * 1000;
-  const gate = opts.gate ?? DEFAULT_DEMOD_GATE;
-  const handle = setInterval(() => {
-    analyser.getFloatTimeDomainData(timeBuf);
-    const chunk = timeBuf.subarray(timeBuf.length - samplesPerBit);
-    const gated = demodBitGated(chunk, sampleRate, fsk, gate);
+  node.port.onmessage = (event: MessageEvent) => {
+    const data = event.data as {
+      powerLow: number;
+      powerHigh: number;
+      controls: number[];
+      rms: number;
+    };
+    const gated = applyDemodGate(
+      data.powerLow,
+      data.powerHigh,
+      data.controls,
+      gate,
+    );
     if (gated.hasCarrier) {
       bitBuffer.push(gated.bit);
       if (bitBuffer.length > 2048) bitBuffer.splice(0, bitBuffer.length - 1024);
       tryDecode(bitBuffer, opts.session, startedAt, opts.onMessage);
     }
     if (opts.onBit) {
-      let sumSq = 0;
-      for (let i = 0; i < chunk.length; i++) sumSq += chunk[i]! * chunk[i]!;
-      const rms = Math.sqrt(sumSq / chunk.length);
       opts.onBit(gated.bit, {
-        rms,
-        powerLow: gated.powerLow,
-        powerHigh: gated.powerHigh,
+        rms: data.rms,
+        powerLow: data.powerLow,
+        powerHigh: data.powerHigh,
         noiseFloor: gated.noiseFloor,
         snr: gated.snr,
+        coherence: gated.coherence,
         hasCarrier: gated.hasCarrier,
         controlHz: gate.controlHz,
       });
     }
-  }, intervalMs);
+  };
   return {
     sampleRate,
     samplesPerBit,
     contextState: () => audioCtx.state,
     stop(): void {
-      clearInterval(handle);
+      node.port.onmessage = null;
+      try {
+        node.disconnect();
+      } catch {
+        /* already disconnected */
+      }
+      src.disconnect();
       for (const track of stream.getTracks()) track.stop();
       void audioCtx.close();
     },
@@ -181,12 +213,6 @@ function tryDecode(
     }
     return;
   }
-}
-
-function nearestPow2(n: number): number {
-  let p = 32;
-  while (p < n) p <<= 1;
-  return p;
 }
 
 export interface TransmitOptions {

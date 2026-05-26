@@ -105,4 +105,22 @@ describe("demodBitGated", () => {
     const result = demodBitGated(silent, sampleRate);
     expect(result.hasCarrier).toBe(false);
   });
+
+  it("rejects mixed-tone broadband signal via coherence check", () => {
+    // Simulate something like a drum hit on the desk: strong energy at
+    // both mark frequencies simultaneously. SNR vs floor would pass, but
+    // the coherence (peak/valley) ratio is near 1 so the gate should
+    // reject this as not-real-FSK.
+    const samples = new Float32Array(samplesPerBit);
+    for (let i = 0; i < samples.length; i++) {
+      const t = i / sampleRate;
+      samples[i] =
+        0.3 * Math.sin(2 * Math.PI * DEFAULT_FSK_PARAMS.markLowHz * t) +
+        0.3 * Math.sin(2 * Math.PI * DEFAULT_FSK_PARAMS.markHighHz * t);
+    }
+    const result = demodBitGated(samples, sampleRate);
+    // Both bins should be roughly equal → coherence near 1.
+    expect(result.coherence).toBeLessThan(DEFAULT_DEMOD_GATE.coherenceThreshold);
+    expect(result.hasCarrier).toBe(false);
+  });
 });

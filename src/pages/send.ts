@@ -239,6 +239,7 @@ function paintBackchannelDiagnostics(): void {
   const highDb = 10 * Math.log10(Math.max(lastDiag.powerHigh, 1e-9));
   const floorDb = 10 * Math.log10(Math.max(lastDiag.noiseFloor, 1e-9));
   const snrDb = 10 * Math.log10(Math.max(lastDiag.snr, 1e-9));
+  const cohDb = 10 * Math.log10(Math.max(lastDiag.coherence, 1e-9));
   const dominantTone =
     lastDiag.powerHigh > lastDiag.powerLow ? "HIGH (1)" : "LOW (0)";
   const bitsLine = recentBits.join("") || "(no carrier-confident bits yet)";
@@ -251,14 +252,16 @@ function paintBackchannelDiagnostics(): void {
   }
   const carrierBadge = lastDiag.hasCarrier ? "● CARRIER" : "○ silent";
   bcDiagOutput.textContent =
-    `ctx=${bcListener.contextState()} sr=${bcListener.sampleRate} samples/bit=${bcListener.samplesPerBit}\n` +
+    `ctx=${bcListener.contextState()} sr=${bcListener.sampleRate} samples/bit=${bcListener.samplesPerBit} (AudioWorklet)\n` +
     `polls observed=${pollsObserved}  bits with carrier=${bitsAccepted}  (${((bitsAccepted / Math.max(1, pollsObserved)) * 100).toFixed(1)}%)\n` +
     `mic RMS:   ${lastDiag.rms.toExponential(2)}  (${rmsDb.toFixed(1)} dBFS)\n` +
     `power LOW  (${1200} Hz): ${lastDiag.powerLow.toExponential(2)}  (${lowDb.toFixed(1)} dB)\n` +
     `power HIGH (${2200} Hz): ${lastDiag.powerHigh.toExponential(2)}  (${highDb.toFixed(1)} dB)\n` +
     `noise floor (median of [${lastDiag.controlHz.join(", ")}] Hz): ` +
     `${lastDiag.noiseFloor.toExponential(2)}  (${floorDb.toFixed(1)} dB)\n` +
-    `SNR: ${lastDiag.snr.toExponential(2)}  (${snrDb.toFixed(1)} dB)   ${carrierBadge}\n` +
+    `SNR (peak/floor): ${lastDiag.snr.toExponential(2)}  (${snrDb.toFixed(1)} dB)\n` +
+    `coherence (peak/valley): ${lastDiag.coherence.toExponential(2)}  (${cohDb.toFixed(1)} dB)\n` +
+    `${carrierBadge}\n` +
     `→ dominant tone (if carrier): ${dominantTone}\n` +
     `\n` +
     `last ${recentBits.length} carrier-confident bits (newest right):\n` +
