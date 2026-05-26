@@ -15,7 +15,7 @@ import {
   decodeHello,
   payloadCellCount,
   pickCellSizeFromCapabilities,
-  rsDecodeAll,
+  rsDecodeFrame,
   type SessionInfo,
 } from "../protocol";
 
@@ -38,8 +38,6 @@ const log = document.querySelector<HTMLPreElement>("#bc-log")!;
 
 const capacityCells = payloadCellCount(DEFAULT_GEOMETRY);
 const capacityBytes = (capacityCells * 2) / 8;
-const RS_BLOCKS = Math.floor(capacityBytes / 255);
-const RS_ENCODED_BYTES = RS_BLOCKS * 255;
 
 // Use a wildcard "match any session" by trying a few common candidate IDs.
 // For M11's done-when the TX hardcodes 0xb4cbac0c.
@@ -116,10 +114,10 @@ function decodeOnce(): void {
   );
   if (!d.result) return;
   const allBytes = cellsToBytes(d.result.cells, PALETTE_2BIT);
-  if (allBytes.length < RS_ENCODED_BYTES) return;
+  if (allBytes.length < capacityBytes) return;
   let wire: Uint8Array;
   try {
-    wire = rsDecodeAll(allBytes.subarray(0, RS_ENCODED_BYTES), NSYM);
+    wire = rsDecodeFrame(allBytes.subarray(0, capacityBytes), capacityBytes, NSYM);
   } catch {
     return;
   }

@@ -10,8 +10,8 @@ import {
   encodeBackChannelFrame,
   encodeHello,
   payloadCellCount,
-  rsDecodeAll,
-  rsEncode,
+  rsDecodeFrame,
+  rsEncodeFrame,
   type SessionInfo,
 } from "./index";
 
@@ -27,17 +27,12 @@ const SESSION: SessionInfo = { sessionId: 0xb4cbac0c };
 it("M11 back-channel hello message round-trips through the full byte pipeline", () => {
   const original = encodeHello("hello back");
   const wire = encodeBackChannelFrame(original, SESSION, 0);
-  const ecc = rsEncode(wire, NSYM);
-
   const capacityCells = payloadCellCount(DEFAULT_GEOMETRY);
   const capacityBytes = (capacityCells * 2) / 8;
-  const RS_BLOCKS = Math.floor(capacityBytes / 255);
-  const RS_ENCODED_BYTES = RS_BLOCKS * 255;
-  const framePayload = new Uint8Array(capacityBytes);
-  framePayload.set(ecc);
+  const framePayload = rsEncodeFrame(wire, capacityBytes, NSYM);
   const cells = bytesToCells(framePayload, PALETTE_2BIT);
   const sampled = cellsToBytes(cells, PALETTE_2BIT);
-  const decoded = rsDecodeAll(sampled.subarray(0, RS_ENCODED_BYTES), NSYM);
+  const decoded = rsDecodeFrame(sampled.subarray(0, capacityBytes), capacityBytes, NSYM);
 
   const parsed = decodeBackChannelFrame(decoded, SESSION);
   expect(parsed).not.toBeNull();

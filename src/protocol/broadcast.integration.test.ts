@@ -18,8 +18,8 @@ import {
   newFountainDecoder,
   payloadCellCount,
   recoverPayload,
-  rsDecodeAll,
-  rsEncode,
+  rsDecodeFrame,
+  rsEncodeFrame,
   sourcePacketSizeForGeometry,
   type BootstrapFields,
   EXTENDED_SLOT_TOTAL,
@@ -61,8 +61,6 @@ describe("M10 broadcast end-to-end (no camera, byte pipeline only)", () => {
 
     const capacityCells = payloadCellCount(DEFAULT_GEOMETRY);
     const capacityBytes = (capacityCells * 2) / 8;
-    const RS_BLOCKS = Math.floor(capacityBytes / 255);
-    const RS_ENCODED_BYTES = RS_BLOCKS * 255;
 
     // Generate a long stream of broadcast frames (more than enough for decoding).
     const totalFrames = 4 * K;
@@ -86,13 +84,11 @@ describe("M10 broadcast end-to-end (no camera, byte pipeline only)", () => {
         extendedData: data,
       };
       const wire = encodeBroadcastFrame({ bootstrap, encoded });
-      const ecc = rsEncode(wire, NSYM);
+      const framePayload = rsEncodeFrame(wire, capacityBytes, NSYM);
       // Round-trip through cells too, to catch any framing-cell mismatch.
-      const framePayload = new Uint8Array(capacityBytes);
-      framePayload.set(ecc);
       const cells = bytesToCells(framePayload, PALETTE_2BIT);
       const sampled = cellsToBytes(cells, PALETTE_2BIT);
-      wires.push(sampled.subarray(0, RS_ENCODED_BYTES));
+      wires.push(sampled.subarray(0, capacityBytes));
     }
 
     // Receiver A tunes in at frame 0; receiver B tunes in at frame K (a bit
@@ -101,7 +97,7 @@ describe("M10 broadcast end-to-end (no camera, byte pipeline only)", () => {
       let acc: ReturnType<typeof newBootstrapAccumulator> | null = null;
       let dec: ReturnType<typeof newFountainDecoder> | null = null;
       for (let i = startIdx; i < wires.length; i++) {
-        const dataBytes = rsDecodeAll(wires[i]!, NSYM);
+        const dataBytes = rsDecodeFrame(wires[i]!, capacityBytes, NSYM);
         const frame = decodeBroadcastFrame(dataBytes, S);
         expect(frame).not.toBeNull();
         if (!acc || !dec) {

@@ -20,7 +20,7 @@ import {
   mimeIndexFor,
   payloadCellCount,
   renderFrame,
-  rsEncode,
+  rsEncodeFrame,
   sourcePacketSizeForGeometry,
   type BootstrapFields,
 } from "../protocol";
@@ -44,8 +44,6 @@ const ctx = canvas.getContext("2d")!;
 
 const capacityCells = payloadCellCount(DEFAULT_GEOMETRY);
 const capacityBytes = (capacityCells * 2) / 8;
-const RS_BLOCKS = Math.floor(capacityBytes / 255);
-const RS_ENCODED_BYTES = RS_BLOCKS * 255;
 const SOURCE_PACKET_SIZE = sourcePacketSizeForGeometry(DEFAULT_GEOMETRY, NSYM);
 
 interface BroadcastSession {
@@ -133,17 +131,8 @@ function emitFrame(): void {
   frameCounter++;
 
   const wire = encodeBroadcastFrame({ bootstrap, encoded });
-  if (wire.length > RS_BLOCKS * (255 - NSYM)) {
-    status.textContent = `internal error: wire ${wire.length} > RS data budget ${RS_BLOCKS * (255 - NSYM)}`;
-    return;
-  }
-  const ecc = rsEncode(wire, NSYM);
-  if (ecc.length > RS_ENCODED_BYTES) {
-    status.textContent = `internal error: ECC ${ecc.length} > frame budget ${RS_ENCODED_BYTES}`;
-    return;
-  }
-  const framePayload = new Uint8Array(capacityBytes);
-  framePayload.set(ecc);
+  // rsEncodeFrame fills exactly capacityBytes and throws on oversize.
+  const framePayload = rsEncodeFrame(wire, capacityBytes, NSYM);
   const cells = bytesToCells(framePayload, PALETTE_2BIT);
   const img = renderFrame(DEFAULT_GEOMETRY, PALETTE_2BIT, cells, CELL_SIZE_PX);
   canvas.width = img.width;

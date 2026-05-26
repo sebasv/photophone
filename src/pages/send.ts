@@ -16,7 +16,8 @@ import {
   packetize,
   payloadCellCount,
   renderFrame,
-  rsEncode,
+  rsEncodeFrame,
+  maxFrameDataBytes,
   type SessionInfo,
 } from "../protocol";
 
@@ -29,7 +30,7 @@ import {
  * - "Start streaming" cycles through every packet of the payload at a
  *   fixed frame rate, looping indefinitely so a continuously-watching
  *   receiver can collect missing packets across multiple passes.
- * - Every wire packet is RS-encoded via `rsEncode(packet, NSYM)` (no u16 length prefix — the wire packet self-describes via its `payload_len` header field, and the magic must remain at cell 0 for the orientation check)
+ * - Every wire packet is RS-encoded via `rsEncodeFrame(packet, capacityBytes, NSYM)` (no u16 length prefix — the wire packet self-describes via its `payload_len` header field, and the magic must remain at cell 0 for the orientation check). rsEncodeFrame fills exactly capacityBytes via N full RS blocks + one partial block — uses every byte of frame budget
  *   before going onto the cells, so a handful of cell-classification
  *   errors per frame can be corrected by the receiver. Without this the
  *   u32 `payload_offset` in the header gets corrupted by a single
@@ -61,13 +62,11 @@ const capacityBytes = (capacityCells * 2) / 8;
 // blocks is whatever fits in the frame; remaining cells are filled with
 // zeros and ignored by the receiver.
 const NSYM = 32;
-const RS_BLOCKS = Math.floor(capacityBytes / 255);
-const RS_ENCODED_BYTES = RS_BLOCKS * 255;
-const RS_DATA_BYTES = RS_BLOCKS * (255 - NSYM);
+const RS_DATA_BYTES = maxFrameDataBytes(capacityBytes, NSYM);
 
-// `rsEncode` keeps the message bytes at the start of the encoded
-// stream (systematic encoding), so the wire packet's magic stays at
-// cell 0 where the rotation check expects it. The wire packet is
+// rsEncodeFrame's underlying RS encoder is systematic — message
+// bytes come first in each block, so the wire packet's magic stays
+// at cell 0 where the rotation check expects it. The wire packet is
 // self-describing via its `payload_len` field; no external length
 // prefix needed.
 const maxWirePerFrame = RS_DATA_BYTES;
@@ -144,16 +143,11 @@ function stopStreaming(): void {
 }
 
 function renderWirePacket(wirePacket: Uint8Array): void {
-  const ecc = rsEncode(wirePacket, NSYM);
-  if (ecc.length > RS_ENCODED_BYTES) {
-    status.textContent = `internal error: ECC produced ${ecc.length} bytes > ${RS_ENCODED_BYTES} frame budget`;
-    return;
-  }
-  // Pad the ECC output to the full frame byte capacity. The receiver
-  // ignores anything past RS_ENCODED_BYTES, so the padding bytes (and
-  // the cells they encode) are inert.
-  const framePayload = new Uint8Array(capacityBytes);
-  framePayload.set(ecc);
+  // rsEncodeFrame returns exactly `capacityBytes` of RS-protected output:
+  // N full 255-byte blocks plus a partial last block sized to the
+  // remaining capacity. Uses every byte of frame budget (~21% more data
+  // than a "floor to full blocks" layout would carry).
+  const framePayload = rsEncodeFrame(wirePacket, capacityBytes, NSYM);
   const cells = bytesToCells(framePayload, PALETTE_2BIT);
   const img = renderFrame(DEFAULT_GEOMETRY, PALETTE_2BIT, cells, CELL_SIZE_PX);
   canvas.width = img.width;

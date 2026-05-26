@@ -13,7 +13,7 @@ import {
   encodeHello,
   payloadCellCount,
   renderFrame,
-  rsEncode,
+  rsEncodeFrame,
   type Capabilities,
   type SessionInfo,
 } from "../protocol";
@@ -43,8 +43,6 @@ const ctx = canvas.getContext("2d")!;
 
 const capacityCells = payloadCellCount(DEFAULT_GEOMETRY);
 const capacityBytes = (capacityCells * 2) / 8;
-const RS_BLOCKS = Math.floor(capacityBytes / 255);
-const RS_ENCODED_BYTES = RS_BLOCKS * 255;
 
 let seq = 0;
 let intervalId: ReturnType<typeof setInterval> | null = null;
@@ -87,13 +85,7 @@ function renderMessage(): void {
   }
   const wire = encodeBackChannelFrame(msg, SESSION, seq);
   seq++;
-  const ecc = rsEncode(wire, NSYM);
-  if (ecc.length > RS_ENCODED_BYTES) {
-    status.textContent = `internal error: ecc ${ecc.length} > ${RS_ENCODED_BYTES}`;
-    return;
-  }
-  const framePayload = new Uint8Array(capacityBytes);
-  framePayload.set(ecc);
+  const framePayload = rsEncodeFrame(wire, capacityBytes, NSYM);
   const cells = bytesToCells(framePayload, PALETTE_2BIT);
   const img = renderFrame(DEFAULT_GEOMETRY, PALETTE_2BIT, cells, CELL_SIZE_PX);
   canvas.width = img.width;

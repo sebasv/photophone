@@ -215,3 +215,89 @@ function makeRng(seed: number): () => number {
     return s >>> 0;
   };
 }
+
+
+import {
+  maxFrameDataBytes,
+  rsDecodeFrame,
+  rsEncodeFrame,
+} from "./ecc";
+
+describe("rsEncodeFrame / rsDecodeFrame — partial last block", () => {
+  it("maxFrameDataBytes: full-multiple capacity matches rsEncode behaviour", () => {
+    // 3 × 255 = 765 capacity with NSYM=32 → 3 full blocks, no partial.
+    expect(maxFrameDataBytes(765, 32)).toBe(3 * (255 - 32));
+  });
+
+  it("maxFrameDataBytes: partial block adds (remaining - nsym) data bytes", () => {
+    // 939 capacity (the default geometry) with NSYM=32:
+    //   3 full blocks → 765 bytes
+    //   174 partial   → 142 data + 32 parity
+    //   total data    → 3*223 + 142 = 811
+    expect(maxFrameDataBytes(939, 32)).toBe(3 * 223 + 142);
+  });
+
+  it("maxFrameDataBytes: partial smaller than nsym contributes zero", () => {
+    // 765 + 20 capacity, NSYM=32: 20-byte tail has no room for data.
+    expect(maxFrameDataBytes(785, 32)).toBe(3 * 223);
+  });
+
+  it("round-trip: 939-byte frame at default geometry — 811 data bytes recoverable", () => {
+    const data = new Uint8Array(811);
+    for (let i = 0; i < data.length; i++) data[i] = (i * 37 + 11) & 0xff;
+    const encoded = rsEncodeFrame(data, 939, 32);
+    expect(encoded.length).toBe(939);
+    const decoded = rsDecodeFrame(encoded, 939, 32);
+    expect(decoded.length).toBe(811);
+    expect(decoded).toEqual(data);
+  });
+
+  it("round-trip: partial-only short frame (no full blocks at all)", () => {
+    // 100-byte capacity with NSYM=32: 0 full blocks + 100-byte partial
+    // = 68 data bytes.
+    const cap = 100;
+    const data = new Uint8Array(maxFrameDataBytes(cap, 32));
+    for (let i = 0; i < data.length; i++) data[i] = i & 0xff;
+    const encoded = rsEncodeFrame(data, cap, 32);
+    expect(encoded.length).toBe(cap);
+    expect(rsDecodeFrame(encoded, cap, 32)).toEqual(data);
+  });
+
+  it("round-trip: msg shorter than capacity gets zero-padded internally", () => {
+    const data = new Uint8Array(50);
+    for (let i = 0; i < data.length; i++) data[i] = 0xa5;
+    const encoded = rsEncodeFrame(data, 939, 32);
+    const decoded = rsDecodeFrame(encoded, 939, 32);
+    expect(decoded.length).toBe(811);
+    expect(decoded.subarray(0, 50)).toEqual(data);
+    // rest is zero-padded.
+    for (let i = 50; i < decoded.length; i++) expect(decoded[i]).toBe(0);
+  });
+
+  it("corrects up to nsym/2 errors per block, including the partial block", () => {
+    const data = new Uint8Array(811);
+    for (let i = 0; i < data.length; i++) data[i] = (i * 53) & 0xff;
+    const encoded = rsEncodeFrame(data, 939, 32);
+    // Inject 8 errors into each block. NSYM=32 corrects up to 16 errors.
+    const corrupted = new Uint8Array(encoded);
+    const errorOffsets = [
+      0, 30, 60, 90, 120, 150, 180, 210,           // block 0 (255)
+      256, 280, 300, 330, 360, 390, 420, 450,      // block 1
+      512, 540, 570, 600, 630, 660, 690, 720,      // block 2
+      770, 800, 830, 860, 880, 900, 920, 935,      // partial block (174 bytes, indices 765..938)
+    ];
+    for (const off of errorOffsets) corrupted[off]! ^= 0xff;
+    const decoded = rsDecodeFrame(corrupted, 939, 32);
+    expect(decoded).toEqual(data);
+  });
+
+  it("rejects when encoded length doesn't match capacity", () => {
+    const encoded = new Uint8Array(900);
+    expect(() => rsDecodeFrame(encoded, 939, 32)).toThrow();
+  });
+
+  it("rejects when msg exceeds frame capacity", () => {
+    const tooBig = new Uint8Array(maxFrameDataBytes(939, 32) + 1);
+    expect(() => rsEncodeFrame(tooBig, 939, 32)).toThrow();
+  });
+});
