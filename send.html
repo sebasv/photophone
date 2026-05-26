@@ -25,6 +25,18 @@
       <section class="stage">
         <canvas id="frame-canvas"></canvas>
       </section>
+      <section class="back-channel">
+        <h2>Audio back-channel</h2>
+        <p class="tagline">Listen for FSK messages from the receiver while
+          streaming. Microphone permission required.</p>
+        <div class="controls">
+          <button id="bc-start">Listen for back-channel</button>
+          <span id="bc-status" class="status">back-channel idle</span>
+        </div>
+        <div class="output">
+          <pre id="bc-log">No back-channel messages yet.</pre>
+        </div>
+      </section>
     </main>
     <script type="module" src="/src/pages/send.ts"></script>
   </body>

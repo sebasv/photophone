@@ -19,6 +19,12 @@ import {
   rsEncode,
   type SessionInfo,
 } from "../protocol";
+import {
+  describeBackchannelMessage,
+  startAudioBackchannelListener,
+  type DecodedBackchannelFrame,
+  type ListenerHandle,
+} from "../runtime/audio-backchannel";
 
 /**
  * Sender — M4 single-frame render + M6 continuous streaming + M8 wire-byte
@@ -141,6 +147,64 @@ function stopStreaming(): void {
     streamIntervalId = null;
   }
   streamButton.textContent = "Start streaming";
+}
+
+// -------------------------------------------------------------------------
+// Audio back-channel listener — integrated with the sender so the user
+// doesn't have to flip between pages to see what the receiver is saying.
+// The visual data path (sender → receiver) uses screen + camera; the
+// back-channel runs in the opposite direction via mic + speaker. Same
+// session id so the receiver's transmitter and our listener line up
+// without configuration.
+// -------------------------------------------------------------------------
+
+const bcStartButton = document.querySelector<HTMLButtonElement>("#bc-start")!;
+const bcStatus = document.querySelector<HTMLSpanElement>("#bc-status")!;
+const bcLog = document.querySelector<HTMLPreElement>("#bc-log")!;
+const BC_LOG_MAX = 20;
+let bcListener: ListenerHandle | null = null;
+const bcMessages: { atMs: number; seq: number; line: string }[] = [];
+
+bcStartButton.addEventListener("click", async () => {
+  if (bcListener) {
+    bcListener.stop();
+    bcListener = null;
+    bcStartButton.textContent = "Listen for back-channel";
+    bcStatus.textContent = "back-channel idle";
+    return;
+  }
+  bcStartButton.disabled = true;
+  bcStatus.textContent = "requesting microphone…";
+  try {
+    bcListener = await startAudioBackchannelListener({
+      session: SESSION,
+      onMessage: handleBackchannelMessage,
+    });
+    bcStatus.textContent =
+      `listening (sr=${bcListener.sampleRate}, ${bcListener.samplesPerBit} samples/bit)`;
+    bcStartButton.textContent = "Stop listening";
+  } catch (err) {
+    bcStatus.textContent = `mic error: ${(err as Error).message}`;
+  } finally {
+    bcStartButton.disabled = false;
+  }
+});
+
+function handleBackchannelMessage(frame: DecodedBackchannelFrame): void {
+  const line = describeBackchannelMessage(frame.msg);
+  bcMessages.push({ atMs: frame.atMs, seq: frame.seq, line });
+  if (bcMessages.length > BC_LOG_MAX) {
+    bcMessages.splice(0, bcMessages.length - BC_LOG_MAX);
+  }
+  bcLog.textContent = bcMessages
+    .map((m) => `[+${formatMs(m.atMs)}, seq ${m.seq}] ${m.line}`)
+    .join("\n");
+  bcStatus.textContent = `last: ${line}`;
+}
+
+function formatMs(ms: number): string {
+  if (ms < 1000) return `${ms} ms`;
+  return `${(ms / 1000).toFixed(1)} s`;
 }
 
 function renderWirePacket(wirePacket: Uint8Array): void {
