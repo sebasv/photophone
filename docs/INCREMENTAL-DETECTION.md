@@ -34,20 +34,29 @@ full-frame fallback to a cheap window scan.
 ## Algorithm sketch
 
 ```
-detectFiducialsInWindows(img, expected, windowRadius):
-  for each corner in (tl, tr, br, bl):
-    roiX = clamp(expected[corner].x - windowRadius, 0, img.width)
-    roiY = clamp(expected[corner].y - windowRadius, 0, img.height)
-    roiW = clamp(expected[corner].x + windowRadius, 0, img.width) - roiX
-    roiH = clamp(expected[corner].y + windowRadius, 0, img.height) - roiY
+detectFiducialsInWindows(img, cachedFiducials, cachedOtsu, cachedFiducialSizePx):
+  # Window radius scales with the fiducial size — closer camera = bigger
+  # fiducials on screen + bigger jumps between frames. 1× the fiducial
+  # side length is a sensible default; it permits ~one-fiducial-width
+  # of motion per frame, which is way more than typical hand wobble.
+  windowRadius = cachedFiducialSizePx
 
-    # Local Otsu on just this ROI — keeps threshold robust under
-    # uneven lighting across the screen.
-    threshold = otsuThreshold(img, roi)
+  # Reuse the cached full-image Otsu threshold from the last full
+  # detect. We do NOT recompute Otsu per window: (a) it's wasteful on
+  # 64×64 pixel patches, (b) any failed decode bounces us straight to
+  # a full-image re-detect that refreshes the threshold for free, so
+  # the cached value is at most one failed-decode-cycle stale.
+  threshold = cachedOtsu
+
+  for each corner in (tl, tr, br, bl):
+    roiX = clamp(cachedFiducials[corner].x - windowRadius, 0, img.width)
+    roiY = clamp(cachedFiducials[corner].y - windowRadius, 0, img.height)
+    roiW = clamp(cachedFiducials[corner].x + windowRadius, 0, img.width) - roiX
+    roiH = clamp(cachedFiducials[corner].y + windowRadius, 0, img.height) - roiY
 
     # Connected components ONLY within the ROI. The current
-    # findComponents scans the whole image; we'd add a version that
-    # respects roi bounds.
+    # findComponents scans the whole image; we add a sibling version
+    # that respects roi bounds.
     whites = findComponentsInROI(img, threshold, predicate=brighter, roi)
     darks  = findComponentsInROI(img, threshold, predicate=darker,  roi)
 
@@ -56,31 +65,65 @@ detectFiducialsInWindows(img, expected, windowRadius):
     candidates = pairAndFilter(whites, darks)
     if !candidates: return null    # fall through to full-frame
 
-    # Pick the candidate closest to the expected position — there
+    # Pick the candidate closest to the cached position — there
     # should usually be exactly one anyway.
-    chosen[corner] = candidates.minBy(|c| distance(c.centroid, expected[corner]))
+    chosen[corner] = candidates.minBy(|c| distance(c.centroid, cachedFiducials[corner]))
 
   return chosen as FiducialCorners
 ```
 
 `findComponentsInROI` is the only new primitive — restrict the
 flood-fill / two-pass labeling to pixels inside `(roiX, roiY, roiX+roiW,
-roiY+roiH)`. Everything else (Otsu, ratio match, cross-section) already
+roiY+roiH)`. Everything else (ratio match, cross-section) already
 exists and works on arbitrary pixel sets.
+
+**`cachedFiducialSizePx`** is estimated from the cached corner
+quadrilateral and the geometry — the canvas spans `g.cellsX` cells on a
+side, the fiducial spans `g.fiducialSize` cells, so:
+
+```
+sidePx = mean(|cachedFiducials.tl - cachedFiducials.tr|,
+              |cachedFiducials.tr - cachedFiducials.br|, …)
+cachedFiducialSizePx = sidePx * (g.fiducialSize / g.cellsX)
+```
+
+This auto-scales: closer camera → larger fiducials on screen → larger
+search window, exactly matching how fast pixels move per frame.
+
+## State additions to `WarpedDecoderState`
+
+To support the window search, the decoder state grows two fields:
+
+```ts
+interface WarpedDecoderState {
+  lastFiducials: [Point, Point, Point, Point] | null;
+  lastRotation: number;
+  lastOtsuThreshold: number;       // NEW — captured on every full detect
+  lastFiducialSizePx: number;      // NEW — derived from lastFiducials + g
+  // ... existing stats counters
+}
+```
+
+Both are populated whenever `decodeFrameWarpedStateful` completes the
+slow path successfully, alongside `lastFiducials` and `lastRotation`.
+
+## Decisions
+
+1. **Window radius — adaptive to fiducial size.** Use `1 × cachedFiducialSizePx`
+   (derived from the cached corner quad and the geometry, see above).
+   Auto-scales with camera distance and is comfortably larger than
+   per-frame hand wobble at any realistic fps.
+
+2. **Otsu threshold — cached, not recomputed per window.** Reuse
+   `state.lastOtsuThreshold` from the last full detect. A failed decode
+   bounces straight to a full-image re-detect that refreshes the
+   threshold for free, so the cached value is at most one failed-decode
+   stale. No per-window Otsu work — saves ~4 redundant histogram passes
+   per frame.
 
 ## Open questions to discuss
 
-1. **What window radius?** 32 pixels at 30 fps ≈ 960 px/s — easily faster
-   than human hand wobble. But on small screens the fiducials are
-   themselves only ~30-50 px wide; W=32 might land the search window
-   inside a single fiducial. Probably want adaptive: `W = max(32, 2 ×
-   max_fiducial_dimension)`.
-
-2. **Per-window or per-image Otsu?** Per-window is more robust to
-   uneven backlight but more expensive. The current `otsuThreshold` is
-   already cheap (~1 ms full-image); a 64×64 window is ~500× smaller.
-
-3. **What if more than one PDP candidate lands in a window?** Currently
+1. **What if more than one PDP candidate lands in a window?** Currently
    `pickFourPDPs` solves the global ambiguity with the convex-quad
    constraint. Per-window we lose that. Suggested heuristic: pick the
    candidate whose centroid is closest to the cached position. Risk:
@@ -88,9 +131,16 @@ exists and works on arbitrary pixel sets.
    the chosen quadrilateral fails convexity, abandon the window search
    and fall through to full-frame.
 
-4. **State eviction.** After N consecutive fast-path-or-window hits,
-   force a full-image detect anyway as a keep-alive against gradual
-   drift. N = 30 (one second at 30 fps) is a reasonable starting point.
+2. **State eviction / Otsu refresh.** With cached Otsu we accept that the
+   threshold can lag behind a slowly changing lighting condition. The
+   refresh path is "any decode failure → full re-detect → fresh Otsu",
+   which works for sudden changes (room light flips). A slow drift
+   (cloud moves over a window over 30 s) is harder — the cached Otsu
+   keeps decoding "well enough" but progressively worse. Worth adding a
+   keep-alive: after N consecutive fast-path-or-window hits, force a
+   full-image detect anyway. N = 30 (one second at 30 fps) is a
+   reasonable starting point. Tunable from real-stream data once the
+   hit-rate diagnostic in PR #32 is exercised.
 
 ## Skeleton
 
@@ -106,12 +156,23 @@ This branch adds:
 
 ## Implementation sequencing
 
-1. Land PR-A (#32) — done in this branch tree
-2. Add `findComponentsInROI` (~50 lines, parallel to existing
-   `findComponents`)
-3. Add `detectFiducialsInWindows` using `findComponentsInROI` + the
-   existing `verifyCrossSection`
-4. Tests: synthetic camera wobble (rotate + translate a known frame by
-   N pixels, decode, assert window-search picks up the new fiducials)
-5. Flip `useWindowFallback` default to true once the wobble test
-   passes at a 20-pixel offset
+1. PR #32 merged — cached-fiducials fast path lives.
+2. Extend `WarpedDecoderState` with `lastOtsuThreshold` and
+   `lastFiducialSizePx`. Capture both from the slow-path `detectFiducials`
+   on success.
+3. Add `findComponentsInROI(img, predicate, roi)` (~50 lines, parallel to
+   existing `findComponents`).
+4. Add `detectFiducialsInWindows(img, cached, cachedOtsu, fiducialSizePx)`
+   using `findComponentsInROI` + the existing `verifyCrossSection`.
+5. Wire it as the middle tier in `decodeFrameWarpedStateful`:
+     fast path (cached fiducials, cached rotation, magic check)
+       → window search (this PR)
+       → full detect (current fallback)
+6. Tests: synthetic camera wobble — rotate + translate a known frame by
+   N pixels, decode, assert window-search picks up the new fiducials at
+   N up to `~1 × fiducial size`. Also test that a translation larger
+   than the window correctly falls through to full-detect.
+7. Surface a new cachePath label in the diagnostic output:
+   `"window-hit"` — so the PR #32 hit-rate UI on `/receive.html` can
+   distinguish blind-reuse hits from window-search hits, and the keep-
+   alive cadence (open question 2) can be calibrated from real data.
