@@ -986,6 +986,27 @@ export function detectFiducials(
   return pickFourPDPs(pdps, img.width, img.height);
 }
 
+/**
+ * STUB — middle-tier incremental detection (see docs/INCREMENTAL-DETECTION.md).
+ *
+ * Given expected fiducial positions from the previous frame, search a small
+ * window around each one for the real fiducial. This is the path between
+ * "trust the cached corners blindly" (PR #32) and "re-detect on the full
+ * image" (current fallback) — needed for the hand-wobble case where the
+ * camera moved a little but the fiducials are still nearby.
+ *
+ * Not yet implemented. See the design doc for the algorithm sketch and open
+ * questions. Returning null signals the caller should fall through to the
+ * full-image detector, so the stub is safe to call from production paths.
+ */
+export function detectFiducialsInWindows(
+  _img: RawImage,
+  _expected: [Point, Point, Point, Point],
+  _windowRadiusPx: number,
+): [Point, Point, Point, Point] | null {
+  return null;
+}
+
 // =========================================================================
 // M3.5: warped decode with orientation recovery
 // =========================================================================
