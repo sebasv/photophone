@@ -423,10 +423,10 @@ bcSendButton.addEventListener("click", async () => {
 
 bcTestToneButton.addEventListener("click", async () => {
   const ctx = ensureAudioCtx();
-  bcStatus.textContent = "test tone: playing 1600 Hz for 1.5 s…";
+  bcStatus.textContent = "test tone: playing 2200 Hz for 1.5 s…";
   try {
-    await transmitTestTone(ctx, 1600, 1.5);
-    bcStatus.textContent = "test tone done (1.5 s @ 1600 Hz). If the sender's diagnostics didn't see power on HIGH, the acoustic path is broken.";
+    await transmitTestTone(ctx, 2200, 1.5);
+    bcStatus.textContent = "test tone done (1.5 s @ 2200 Hz). The sender's diagnostics should show power HIGH spiking well above LOW and the noise floor.";
   } catch (err) {
     bcStatus.textContent = `test tone error: ${(err as Error).message}`;
   }

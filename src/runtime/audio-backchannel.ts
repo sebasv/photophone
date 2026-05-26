@@ -19,15 +19,16 @@
  */
 
 import {
+  DEFAULT_DEMOD_GATE,
   DEFAULT_FSK_PARAMS,
   audioBackChannelDecode,
   audioBackChannelEncode,
   bitsToBytes,
   bytesToBits,
-  demodBit,
+  demodBitGated,
   fskUnframe,
-  goertzelPower,
   type BackChannelMessage,
+  type DemodGateParams,
   type FskParams,
   type SessionInfo,
 } from "../protocol";
@@ -57,6 +58,14 @@ export interface ListenerDiagnostics {
   powerLow: number;
   /** Goertzel power at MARK_HIGH (bit-1 tone). */
   powerHigh: number;
+  /** Median of Goertzel power at the gate control frequencies. */
+  noiseFloor: number;
+  /** SNR estimate: max(powerLow, powerHigh) / noiseFloor. */
+  snr: number;
+  /** True if SNR + absolute-min thresholds both pass. */
+  hasCarrier: boolean;
+  /** Control-frequency Hz values used for the noise-floor estimate. */
+  controlHz: ReadonlyArray<number>;
 }
 
 export interface ListenerOptions {
@@ -70,6 +79,8 @@ export interface ListenerOptions {
   onBit?: (bit: 0 | 1, diag: ListenerDiagnostics) => void;
   /** Defaults to `DEFAULT_FSK_PARAMS`. */
   fsk?: FskParams;
+  /** Defaults to `DEFAULT_DEMOD_GATE`. */
+  gate?: DemodGateParams;
 }
 
 /**
@@ -106,21 +117,30 @@ export async function startAudioBackchannelListener(
   const bitBuffer: number[] = [];
   const startedAt = performance.now();
   const intervalMs = fsk.bitDurationSec * 1000;
+  const gate = opts.gate ?? DEFAULT_DEMOD_GATE;
   const handle = setInterval(() => {
     analyser.getFloatTimeDomainData(timeBuf);
     const chunk = timeBuf.subarray(timeBuf.length - samplesPerBit);
-    const bit = demodBit(chunk, sampleRate, fsk);
-    bitBuffer.push(bit);
-    if (bitBuffer.length > 2048) bitBuffer.splice(0, bitBuffer.length - 1024);
+    const gated = demodBitGated(chunk, sampleRate, fsk, gate);
+    if (gated.hasCarrier) {
+      bitBuffer.push(gated.bit);
+      if (bitBuffer.length > 2048) bitBuffer.splice(0, bitBuffer.length - 1024);
+      tryDecode(bitBuffer, opts.session, startedAt, opts.onMessage);
+    }
     if (opts.onBit) {
-      const powerLow = goertzelPower(chunk, sampleRate, fsk.markLowHz);
-      const powerHigh = goertzelPower(chunk, sampleRate, fsk.markHighHz);
       let sumSq = 0;
       for (let i = 0; i < chunk.length; i++) sumSq += chunk[i]! * chunk[i]!;
       const rms = Math.sqrt(sumSq / chunk.length);
-      opts.onBit(bit, { rms, powerLow, powerHigh });
+      opts.onBit(gated.bit, {
+        rms,
+        powerLow: gated.powerLow,
+        powerHigh: gated.powerHigh,
+        noiseFloor: gated.noiseFloor,
+        snr: gated.snr,
+        hasCarrier: gated.hasCarrier,
+        controlHz: gate.controlHz,
+      });
     }
-    tryDecode(bitBuffer, opts.session, startedAt, opts.onMessage);
   }, intervalMs);
   return {
     sampleRate,

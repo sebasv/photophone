@@ -172,7 +172,8 @@ const BC_DIAG_STORAGE_KEY = "photophone.bc.diagEnabled";
 let bcListener: ListenerHandle | null = null;
 const bcMessages: { atMs: number; seq: number; line: string }[] = [];
 const recentBits: number[] = [];
-let bitsObserved = 0;
+let pollsObserved = 0;
+let bitsAccepted = 0;
 let lastDiag: ListenerDiagnostics | null = null;
 let lastDiagPaintAt = 0;
 
@@ -210,11 +211,14 @@ bcStartButton.addEventListener("click", async () => {
 });
 
 function handleBackchannelBit(bit: 0 | 1, diag: ListenerDiagnostics): void {
-  recentBits.push(bit);
-  if (recentBits.length > BC_DIAG_BITS) {
-    recentBits.splice(0, recentBits.length - BC_DIAG_BITS);
+  pollsObserved++;
+  if (diag.hasCarrier) {
+    recentBits.push(bit);
+    if (recentBits.length > BC_DIAG_BITS) {
+      recentBits.splice(0, recentBits.length - BC_DIAG_BITS);
+    }
+    bitsAccepted++;
   }
-  bitsObserved++;
   lastDiag = diag;
   if (!bcDiagToggle.checked) return;
   const now = performance.now();
@@ -233,24 +237,31 @@ function paintBackchannelDiagnostics(): void {
   const rmsDb = 20 * Math.log10(Math.max(lastDiag.rms, 1e-9));
   const lowDb = 10 * Math.log10(Math.max(lastDiag.powerLow, 1e-9));
   const highDb = 10 * Math.log10(Math.max(lastDiag.powerHigh, 1e-9));
+  const floorDb = 10 * Math.log10(Math.max(lastDiag.noiseFloor, 1e-9));
+  const snrDb = 10 * Math.log10(Math.max(lastDiag.snr, 1e-9));
   const dominantTone =
     lastDiag.powerHigh > lastDiag.powerLow ? "HIGH (1)" : "LOW (0)";
-  const bitsLine = recentBits.join("");
-  // Try to spot the FSK preamble (0xAA = 10101010) by scanning the last 16
-  // bits for an alternating run.
+  const bitsLine = recentBits.join("") || "(no carrier-confident bits yet)";
+  // Try to spot the FSK preamble (0xAA = 16 alternating bits) by scanning
+  // the most recent bits for the longest trailing alternating run.
   let alternatingRun = 0;
   for (let i = recentBits.length - 1; i > 0; i--) {
     if (recentBits[i] !== recentBits[i - 1]) alternatingRun++;
     else break;
   }
+  const carrierBadge = lastDiag.hasCarrier ? "● CARRIER" : "○ silent";
   bcDiagOutput.textContent =
-    `ctx=${bcListener.contextState()} sr=${bcListener.sampleRate} samples/bit=${bcListener.samplesPerBit}  bits observed=${bitsObserved}\n` +
+    `ctx=${bcListener.contextState()} sr=${bcListener.sampleRate} samples/bit=${bcListener.samplesPerBit}\n` +
+    `polls observed=${pollsObserved}  bits with carrier=${bitsAccepted}  (${((bitsAccepted / Math.max(1, pollsObserved)) * 100).toFixed(1)}%)\n` +
     `mic RMS:   ${lastDiag.rms.toExponential(2)}  (${rmsDb.toFixed(1)} dBFS)\n` +
-    `power LOW  (${800} Hz): ${lastDiag.powerLow.toExponential(2)}  (${lowDb.toFixed(1)} dB)\n` +
-    `power HIGH (${1600} Hz): ${lastDiag.powerHigh.toExponential(2)}  (${highDb.toFixed(1)} dB)\n` +
-    `→ dominant tone: ${dominantTone}\n` +
+    `power LOW  (${1200} Hz): ${lastDiag.powerLow.toExponential(2)}  (${lowDb.toFixed(1)} dB)\n` +
+    `power HIGH (${2200} Hz): ${lastDiag.powerHigh.toExponential(2)}  (${highDb.toFixed(1)} dB)\n` +
+    `noise floor (median of [${lastDiag.controlHz.join(", ")}] Hz): ` +
+    `${lastDiag.noiseFloor.toExponential(2)}  (${floorDb.toFixed(1)} dB)\n` +
+    `SNR: ${lastDiag.snr.toExponential(2)}  (${snrDb.toFixed(1)} dB)   ${carrierBadge}\n` +
+    `→ dominant tone (if carrier): ${dominantTone}\n` +
     `\n` +
-    `last ${recentBits.length} bits (newest right):\n` +
+    `last ${recentBits.length} carrier-confident bits (newest right):\n` +
     `  ${bitsLine}\n` +
     `trailing alternating run: ${alternatingRun} bits  (preamble = 16 alternating)`;
 }
