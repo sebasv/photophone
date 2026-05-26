@@ -26,6 +26,7 @@ import {
   bytesToBits,
   demodBit,
   fskUnframe,
+  goertzelPower,
   type BackChannelMessage,
   type FskParams,
   type SessionInfo,
@@ -47,9 +48,24 @@ export interface ListenerHandle {
   samplesPerBit: number;
 }
 
+export interface ListenerDiagnostics {
+  /** RMS of the most recent sampled chunk. Use as a level meter. */
+  rms: number;
+  /** Goertzel power at MARK_LOW (bit-0 tone) over the same chunk. */
+  powerLow: number;
+  /** Goertzel power at MARK_HIGH (bit-1 tone). */
+  powerHigh: number;
+}
+
 export interface ListenerOptions {
   session: SessionInfo;
   onMessage: (frame: DecodedBackchannelFrame) => void;
+  /**
+   * Per-bit callback with acoustic diagnostics. Fires at the same cadence
+   * as the bit-poll loop (every `bitDurationSec`, ~100 Hz by default).
+   * Pages should rate-limit DOM updates from this callback themselves.
+   */
+  onBit?: (bit: 0 | 1, diag: ListenerDiagnostics) => void;
   /** Defaults to `DEFAULT_FSK_PARAMS`. */
   fsk?: FskParams;
 }
@@ -88,6 +104,14 @@ export async function startAudioBackchannelListener(
     const bit = demodBit(chunk, sampleRate, fsk);
     bitBuffer.push(bit);
     if (bitBuffer.length > 2048) bitBuffer.splice(0, bitBuffer.length - 1024);
+    if (opts.onBit) {
+      const powerLow = goertzelPower(chunk, sampleRate, fsk.markLowHz);
+      const powerHigh = goertzelPower(chunk, sampleRate, fsk.markHighHz);
+      let sumSq = 0;
+      for (let i = 0; i < chunk.length; i++) sumSq += chunk[i]! * chunk[i]!;
+      const rms = Math.sqrt(sumSq / chunk.length);
+      opts.onBit(bit, { rms, powerLow, powerHigh });
+    }
     tryDecode(bitBuffer, opts.session, startedAt, opts.onMessage);
   }, intervalMs);
   return {
@@ -183,6 +207,34 @@ export async function transmitAudioBackchannelMessage(
   osc.stop(tEnd + 0.02);
 
   return { durationSec: bits.length * dt, bits: bits.length };
+}
+
+/**
+ * Play a constant test tone — no encoding, no framing. Used by the
+ * diagnostics path: if the listener sees Goertzel power at this frequency,
+ * the acoustic round-trip is working and any FSK decode failure is in the
+ * bit-recovery / framing layer, not the speakers-to-mic path.
+ */
+export async function transmitTestTone(
+  audioCtx: AudioContext,
+  freqHz: number,
+  durationSec: number,
+  gainPeak = 0.3,
+): Promise<{ durationSec: number; freqHz: number }> {
+  if (audioCtx.state === "suspended") await audioCtx.resume();
+  const t0 = audioCtx.currentTime + 0.05;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.frequency.setValueAtTime(freqHz, t0);
+  gain.gain.setValueAtTime(0, t0 - 0.005);
+  gain.gain.linearRampToValueAtTime(gainPeak, t0);
+  const tEnd = t0 + durationSec;
+  gain.gain.setValueAtTime(gainPeak, tEnd - 0.01);
+  gain.gain.linearRampToValueAtTime(0, tEnd);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(t0 - 0.005);
+  osc.stop(tEnd + 0.02);
+  return { durationSec, freqHz };
 }
 
 // =========================================================================

@@ -30,7 +30,10 @@ import {
   type WarpedDecodeCachePath,
   type WarpedDecoderState,
 } from "../protocol";
-import { transmitAudioBackchannelMessage } from "../runtime/audio-backchannel";
+import {
+  transmitAudioBackchannelMessage,
+  transmitTestTone,
+} from "../runtime/audio-backchannel";
 
 /**
  * Receiver — single-frame capture (M4) + streaming reassembly (M6).
@@ -396,6 +399,7 @@ const bcMessageInput = document.querySelector<HTMLInputElement>("#bc-message")!;
 const bcSendButton = document.querySelector<HTMLButtonElement>("#bc-send")!;
 const bcAutoToggle = document.querySelector<HTMLInputElement>("#bc-auto")!;
 const bcStatus = document.querySelector<HTMLSpanElement>("#bc-status")!;
+const bcTestToneButton = document.querySelector<HTMLButtonElement>("#bc-test-tone")!;
 const BC_AUTO_INTERVAL_MS = 2500;
 const BC_AUTO_STORAGE_KEY = "photophone.bc.autoAnnounce";
 
@@ -415,6 +419,17 @@ bcAutoToggle.addEventListener("change", () => {
 bcSendButton.addEventListener("click", async () => {
   const text = bcMessageInput.value || "hello back";
   await sendHelloBackchannel(text);
+});
+
+bcTestToneButton.addEventListener("click", async () => {
+  const ctx = ensureAudioCtx();
+  bcStatus.textContent = "test tone: playing 1600 Hz for 1.5 s…";
+  try {
+    await transmitTestTone(ctx, 1600, 1.5);
+    bcStatus.textContent = "test tone done (1.5 s @ 1600 Hz). If the sender's diagnostics didn't see power on HIGH, the acoustic path is broken.";
+  } catch (err) {
+    bcStatus.textContent = `test tone error: ${(err as Error).message}`;
+  }
 });
 
 async function sendHelloBackchannel(text: string): Promise<void> {

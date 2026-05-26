@@ -23,6 +23,7 @@ import {
   describeBackchannelMessage,
   startAudioBackchannelListener,
   type DecodedBackchannelFrame,
+  type ListenerDiagnostics,
   type ListenerHandle,
 } from "../runtime/audio-backchannel";
 
@@ -161,9 +162,26 @@ function stopStreaming(): void {
 const bcStartButton = document.querySelector<HTMLButtonElement>("#bc-start")!;
 const bcStatus = document.querySelector<HTMLSpanElement>("#bc-status")!;
 const bcLog = document.querySelector<HTMLPreElement>("#bc-log")!;
+const bcDiagToggle = document.querySelector<HTMLInputElement>("#bc-diag")!;
+const bcDiagPanel = document.querySelector<HTMLElement>("#bc-diag-panel")!;
+const bcDiagOutput = document.querySelector<HTMLPreElement>("#bc-diag-output")!;
 const BC_LOG_MAX = 20;
+const BC_DIAG_BITS = 128;
+const BC_DIAG_REFRESH_MS = 100;
+const BC_DIAG_STORAGE_KEY = "photophone.bc.diagEnabled";
 let bcListener: ListenerHandle | null = null;
 const bcMessages: { atMs: number; seq: number; line: string }[] = [];
+const recentBits: number[] = [];
+let bitsObserved = 0;
+let lastDiag: ListenerDiagnostics | null = null;
+let lastDiagPaintAt = 0;
+
+bcDiagToggle.checked = loadBcDiagEnabled();
+bcDiagPanel.hidden = !bcDiagToggle.checked;
+bcDiagToggle.addEventListener("change", () => {
+  saveBcDiagEnabled(bcDiagToggle.checked);
+  bcDiagPanel.hidden = !bcDiagToggle.checked;
+});
 
 bcStartButton.addEventListener("click", async () => {
   if (bcListener) {
@@ -179,6 +197,7 @@ bcStartButton.addEventListener("click", async () => {
     bcListener = await startAudioBackchannelListener({
       session: SESSION,
       onMessage: handleBackchannelMessage,
+      onBit: handleBackchannelBit,
     });
     bcStatus.textContent =
       `listening (sr=${bcListener.sampleRate}, ${bcListener.samplesPerBit} samples/bit)`;
@@ -189,6 +208,67 @@ bcStartButton.addEventListener("click", async () => {
     bcStartButton.disabled = false;
   }
 });
+
+function handleBackchannelBit(bit: 0 | 1, diag: ListenerDiagnostics): void {
+  recentBits.push(bit);
+  if (recentBits.length > BC_DIAG_BITS) {
+    recentBits.splice(0, recentBits.length - BC_DIAG_BITS);
+  }
+  bitsObserved++;
+  lastDiag = diag;
+  if (!bcDiagToggle.checked) return;
+  const now = performance.now();
+  if (now - lastDiagPaintAt < BC_DIAG_REFRESH_MS) return;
+  lastDiagPaintAt = now;
+  paintBackchannelDiagnostics();
+}
+
+function paintBackchannelDiagnostics(): void {
+  if (!lastDiag || !bcListener) {
+    bcDiagOutput.textContent = "(no diagnostics yet — start listening first)";
+    return;
+  }
+  // Power readings come out of Goertzel as a sum-of-squared accumulator;
+  // a log scale is the only sane way to read them by eye.
+  const rmsDb = 20 * Math.log10(Math.max(lastDiag.rms, 1e-9));
+  const lowDb = 10 * Math.log10(Math.max(lastDiag.powerLow, 1e-9));
+  const highDb = 10 * Math.log10(Math.max(lastDiag.powerHigh, 1e-9));
+  const dominantTone =
+    lastDiag.powerHigh > lastDiag.powerLow ? "HIGH (1)" : "LOW (0)";
+  const bitsLine = recentBits.join("");
+  // Try to spot the FSK preamble (0xAA = 10101010) by scanning the last 16
+  // bits for an alternating run.
+  let alternatingRun = 0;
+  for (let i = recentBits.length - 1; i > 0; i--) {
+    if (recentBits[i] !== recentBits[i - 1]) alternatingRun++;
+    else break;
+  }
+  bcDiagOutput.textContent =
+    `sr=${bcListener.sampleRate} samples/bit=${bcListener.samplesPerBit}  bits observed=${bitsObserved}\n` +
+    `mic RMS:   ${lastDiag.rms.toExponential(2)}  (${rmsDb.toFixed(1)} dBFS)\n` +
+    `power LOW  (${800} Hz): ${lastDiag.powerLow.toExponential(2)}  (${lowDb.toFixed(1)} dB)\n` +
+    `power HIGH (${1600} Hz): ${lastDiag.powerHigh.toExponential(2)}  (${highDb.toFixed(1)} dB)\n` +
+    `→ dominant tone: ${dominantTone}\n` +
+    `\n` +
+    `last ${recentBits.length} bits (newest right):\n` +
+    `  ${bitsLine}\n` +
+    `trailing alternating run: ${alternatingRun} bits  (preamble = 16 alternating)`;
+}
+
+function loadBcDiagEnabled(): boolean {
+  try {
+    return localStorage.getItem(BC_DIAG_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+function saveBcDiagEnabled(enabled: boolean): void {
+  try {
+    localStorage.setItem(BC_DIAG_STORAGE_KEY, enabled ? "1" : "0");
+  } catch {
+    /* localStorage unavailable; silent fallback */
+  }
+}
 
 function handleBackchannelMessage(frame: DecodedBackchannelFrame): void {
   const line = describeBackchannelMessage(frame.msg);

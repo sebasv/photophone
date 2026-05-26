@@ -31,10 +31,17 @@
           streaming. Microphone permission required.</p>
         <div class="controls">
           <button id="bc-start">Listen for back-channel</button>
+          <label class="diagnostics-toggle">
+            <input type="checkbox" id="bc-diag" />
+            <span>Show diagnostics</span>
+          </label>
           <span id="bc-status" class="status">back-channel idle</span>
         </div>
         <div class="output">
           <pre id="bc-log">No back-channel messages yet.</pre>
+        </div>
+        <div class="output diagnostics-panel" id="bc-diag-panel" hidden>
+          <pre id="bc-diag-output">(no diagnostics yet — start listening first)</pre>
         </div>
       </section>
     </main>
