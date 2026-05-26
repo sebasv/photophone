@@ -1357,6 +1357,19 @@ export interface DecodeRotationAttempt {
   matched: boolean;
 }
 
+/**
+ * Which path through the warped decoder produced this frame's result.
+ * "cold" means there was no usable cache (first frame, or after a hard
+ * miss that reset state). "fast-hit" means the cached fiducials +
+ * cached rotation passed the magic check on the first try, skipping the
+ * full-image PDP detection. "fast-miss-fallback" means we tried the
+ * cache first, it failed, and we fell through to the full detect (the
+ * frame still decoded, just via the slow path).
+ *
+ * Stateless callers always see "cold".
+ */
+export type WarpedDecodeCachePath = "cold" | "fast-hit" | "fast-miss-fallback";
+
 export interface DecodeFrameWarpedDiagnostics {
   detection: FiducialDetectionDiagnostics;
   /** One entry per rotation tried (0..3), in order, stopping at the first match. */
@@ -1365,6 +1378,8 @@ export interface DecodeFrameWarpedDiagnostics {
   result: WarpedDecodeResult | null;
   /** Short string describing the failure mode when result is null. */
   failureReason: string | null;
+  /** Which path through the decoder produced this result (M15 follow-up). */
+  cachePath: WarpedDecodeCachePath;
 }
 
 /**
@@ -1376,6 +1391,18 @@ export function decodeFrameWarpedWithDiagnostics(
   palette: Palette,
   img: RawImage,
   cellSizePx: number,
+): DecodeFrameWarpedDiagnostics {
+  return decodeFrameWarpedWithDiagnosticsCore(g, palette, img, cellSizePx, "cold");
+}
+
+/** Internal worker shared between the stateless and stateful diagnostic
+ *  paths. `cachePath` labels which higher-level entry was taken. */
+function decodeFrameWarpedWithDiagnosticsCore(
+  g: FrameGeometry,
+  palette: Palette,
+  img: RawImage,
+  cellSizePx: number,
+  cachePath: WarpedDecodeCachePath,
 ): DecodeFrameWarpedDiagnostics {
   const detection = detectFiducialsWithDiagnostics(img);
   const rotationsAttempted: DecodeRotationAttempt[] = [];
@@ -1389,6 +1416,7 @@ export function decodeFrameWarpedWithDiagnostics(
         detection.allCandidates.length === 0
           ? "no PDP candidates passed the area-ratio and nested-bbox tests"
           : `only ${detection.allCandidates.length} PDPs detected, need 4`,
+      cachePath,
     };
   }
 
@@ -1402,6 +1430,7 @@ export function decodeFrameWarpedWithDiagnostics(
       rotationsAttempted,
       result: null,
       failureReason: `payload region too small to carry the magic (${positions.length} < ${magicCells} cells)`,
+      cachePath,
     };
   }
   const half = cellSizePx / 2;
@@ -1466,6 +1495,7 @@ export function decodeFrameWarpedWithDiagnostics(
           learnedPalette,
         },
         failureReason: null,
+        cachePath,
       };
     }
   }
@@ -1475,5 +1505,80 @@ export function decodeFrameWarpedWithDiagnostics(
     rotationsAttempted,
     result: null,
     failureReason: "no rotation produced the expected magic — frame likely corrupted",
+    cachePath,
   };
+}
+
+/**
+ * Diagnostic-emitting variant of `decodeFrameWarpedStateful`. Tries the
+ * cached fiducials + rotation first; on a magic-pass returns a "fast-hit"
+ * result without running fiducial detection. On a miss, falls through to
+ * the full diagnostic path and labels the result "fast-miss-fallback".
+ * State is updated on every successful decode (cache or full).
+ *
+ * Use this from receive pages so the cache hit rate can be observed live.
+ */
+export function decodeFrameWarpedWithDiagnosticsStateful(
+  g: FrameGeometry,
+  palette: Palette,
+  img: RawImage,
+  cellSizePx: number,
+  state: WarpedDecoderState,
+): DecodeFrameWarpedDiagnostics {
+  // Fast path: reuse cached fiducials + rotation.
+  if (state.lastFiducials) {
+    const cached = tryOneRotation(
+      g, palette, img, state.lastFiducials, state.lastRotation, cellSizePx,
+    );
+    if (cached) {
+      state.consecutiveFastHits++;
+      state.consecutiveMisses = 0;
+      state.totalFastHits++;
+      // Build a minimal diagnostics object — no fiducial detection was
+      // run, so we synthesize an "empty" detection block.
+      return {
+        detection: { otsuThreshold: -1, allCandidates: [], chosen: state.lastFiducials },
+        rotationsAttempted: [{
+          rotation: state.lastRotation,
+          // Re-derive the 4 magic bytes from the result for the UI overlay.
+          magicBytes: magicBytesFromResult(cached, palette),
+          matched: true,
+        }],
+        result: cached,
+        failureReason: null,
+        cachePath: "fast-hit",
+      };
+    }
+    // Fall through with the miss-fallback label.
+  }
+
+  // Slow path with the existing full diagnostic decoder, labelled
+  // appropriately.
+  const label: WarpedDecodeCachePath = state.lastFiducials
+    ? "fast-miss-fallback"
+    : "cold";
+  const d = decodeFrameWarpedWithDiagnosticsCore(g, palette, img, cellSizePx, label);
+  if (d.result) {
+    state.lastFiducials = d.result.imageCornerCentroids;
+    state.lastRotation = d.result.orientation;
+    state.consecutiveFastHits = 0;
+    state.consecutiveMisses = 0;
+    state.totalFullDetects++;
+  } else {
+    state.consecutiveFastHits = 0;
+    state.consecutiveMisses++;
+  }
+  return d;
+}
+
+/** Re-derive the leading magic bytes from a decode result so the
+ *  diagnostic overlay has the same shape on the cache hit path as on
+ *  the cold path. */
+function magicBytesFromResult(
+  r: WarpedDecodeResult,
+  palette: Palette,
+): Uint8Array {
+  const cellsPerByte = 8 / bitsPerCell(palette);
+  const magicCells = MAGIC.length * cellsPerByte;
+  return cellsToBytes(r.cells.subarray(0, magicCells), palette);
 }

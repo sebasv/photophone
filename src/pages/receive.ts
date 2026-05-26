@@ -13,10 +13,12 @@ import {
   PALETTE_2BIT,
   cellsToBytes,
   decodeFrameWarpedWithDiagnostics,
+  decodeFrameWarpedWithDiagnosticsStateful,
   decodePacket,
   ingest,
   missing,
   newReassembly,
+  newWarpedDecoderState,
   payloadCellCount,
   rsDecodeAll,
   type DecodeFrameWarpedDiagnostics,
@@ -24,6 +26,8 @@ import {
   type Point,
   type ReassemblyState,
   type SessionInfo,
+  type WarpedDecodeCachePath,
+  type WarpedDecoderState,
 } from "../protocol";
 
 /**
@@ -71,6 +75,13 @@ let reassembly: ReassemblyState | null = null;
 let packetsAccepted = 0;
 let packetsRejected = 0;
 let framesProcessed = 0;
+
+// M15 — warped-decode cache. Reused across frames in the streaming loop so
+// the receiver pays the full-frame fiducial detection cost only when the
+// geometry actually changes. See PR #32.
+let warpState: WarpedDecoderState = newWarpedDecoderState();
+const CACHE_PATH_WINDOW = 60; // ~6 s at 10 fps — responsive but smooth
+const recentCachePaths: WarpedDecodeCachePath[] = [];
 const rejectCounts: Record<string, number> = {
   "rs-decode-failed": 0,
   "rejected-malformed": 0,
@@ -166,6 +177,39 @@ function captureOnce(): LastCapture | null {
   return { imageData, diagnostics };
 }
 
+/**
+ * Like captureOnce, but threads the streaming `warpState` through the
+ * decoder so cache hits skip the full-frame PDP detection. Used from
+ * the streaming tick — one-shot capture stays stateless so it always
+ * does a clean detect.
+ */
+function captureOnceStateful(): LastCapture | null {
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  if (w === 0 || h === 0) {
+    status.textContent = "camera frame not ready yet — try again in a sec";
+    return null;
+  }
+  const offscreen = document.createElement("canvas");
+  offscreen.width = w;
+  offscreen.height = h;
+  const offCtx = offscreen.getContext("2d", { willReadFrequently: true })!;
+  offCtx.drawImage(video, 0, 0);
+  const imageData = offCtx.getImageData(0, 0, w, h);
+  const rawImage = { data: imageData.data, width: w, height: h };
+  const diagnostics = decodeFrameWarpedWithDiagnosticsStateful(
+    DEFAULT_GEOMETRY,
+    PALETTE_2BIT,
+    rawImage,
+    8,
+    warpState,
+  );
+  // Track the last N cache paths for a windowed hit-rate display.
+  recentCachePaths.push(diagnostics.cachePath);
+  if (recentCachePaths.length > CACHE_PATH_WINDOW) recentCachePaths.shift();
+  return { imageData, diagnostics };
+}
+
 // -------------------------------------------------------------------------
 // Streaming capture + reassembly (M6)
 // -------------------------------------------------------------------------
@@ -185,6 +229,8 @@ function startStreaming(): void {
   framesProcessed = 0;
   for (const k of Object.keys(rejectCounts)) rejectCounts[k] = 0;
   lastRejectPeek = null;
+  warpState = newWarpedDecoderState();
+  recentCachePaths.length = 0;
   streaming = true;
   streamButton.textContent = "Stop receiving";
   saveButton.disabled = true;
@@ -209,7 +255,7 @@ function scheduleNextStreamTick(): void {
 function streamTick(): void {
   if (!streaming || !reassembly) return;
   framesProcessed++;
-  const captured = captureOnce();
+  const captured = captureOnceStateful();
   if (captured) {
     lastCapture = captured;
     const wire = decodedWireBytes(captured.diagnostics);
@@ -273,8 +319,29 @@ function updateProgress(): void {
     `\n` +
     `contiguous from 0: ${contiguousFromZero} bytes    highest seen: ${highest} bytes\n` +
     `${formatProgressBar(Math.max(highest, 1), reassembly.received, 60)}\n` +
-    `gaps below highest: ${gaps.length === 0 ? "none" : gaps.slice(0, 3).map((g) => `[${g.offset}+${g.length}]`).join(" ") + (gaps.length > 3 ? ` … (+${gaps.length - 3} more)` : "")}` +
+    `gaps below highest: ${gaps.length === 0 ? "none" : gaps.slice(0, 3).map((g) => `[${g.offset}+${g.length}]`).join(" ") + (gaps.length > 3 ? ` … (+${gaps.length - 3} more)` : "")}\n` +
+    formatCacheStats() +
     lastRejectLine;
+}
+
+function formatCacheStats(): string {
+  const total = warpState.totalFastHits + warpState.totalFullDetects;
+  if (total === 0) return "warp cache: (no decodes yet)";
+  const lifetimeRate = ((warpState.totalFastHits / total) * 100).toFixed(1);
+  let winHits = 0;
+  let winFallback = 0;
+  let winCold = 0;
+  for (const p of recentCachePaths) {
+    if (p === "fast-hit") winHits++;
+    else if (p === "fast-miss-fallback") winFallback++;
+    else winCold++;
+  }
+  const windowTotal = recentCachePaths.length;
+  const windowRate = windowTotal === 0 ? "—" : ((winHits / windowTotal) * 100).toFixed(1) + "%";
+  return (
+    `warp cache: hits=${warpState.totalFastHits} full=${warpState.totalFullDetects} ` +
+    `lifetime=${lifetimeRate}%    last ${windowTotal}: hits=${winHits} fallback=${winFallback} cold=${winCold} window=${windowRate}`
+  );
 }
 
 function formatProgressBar(

@@ -62,6 +62,34 @@ Order of expected impact:
    across same-rotation re-attempts on a stationary camera; precompute
    homographies for the 4 rotations once per fiducial set.
 
+## Incremental fiducial detection (in progress)
+
+A separate axis from raw shader perf — keeps the existing CPU pipeline
+but avoids re-running it when the camera-screen geometry hasn't
+changed between frames.
+
+- **PR #32 (landing): cached fiducials + rotation.** Stateful sibling
+  of `decodeFrameWarped` that blindly reuses last-frame's corners +
+  rotation, validates via the magic check, falls back to a full detect
+  on miss. Measured 150× on the warm path (73 Hz → 11 kHz). Covers
+  ~tripod-stable and steady-hand scenarios. Receive page surfaces
+  `lifetime` and `last-60-frame` hit rates so the cache behaviour is
+  observable on real cameras.
+- **PR #33 (design draft): small-window fiducial search.** Middle tier
+  between PR #32's blind-reuse and the full-image fallback. When the
+  cache fails magic but the real fiducials are still close (hand
+  wobble at typical fps: ≤ 20 px/frame), search a ±W pixel window
+  around each cached corner before going full-frame. Algorithm sketch
+  + 4 open questions in `docs/INCREMENTAL-DETECTION.md`.
+- **TODO — implement the small-window search when needed.** The
+  signal to start work: hardware-validated cache miss rate from PR
+  #32's diagnostics. If the `last-60-frame` hit rate sits comfortably
+  above ~90 % in realistic use (hand-held phone reading a laptop
+  screen), the window search is over-engineering and can stay
+  parked. If the miss rate climbs above ~25 %, implement PR #33's
+  design — `findComponentsInROI` is the single new primitive needed,
+  the rest reuses existing PDP detection logic.
+
 ## Running the bench
 
 ```

@@ -106,3 +106,53 @@ describe("decodeFrameWarpedStateful — measurable speedup of the fast path", ()
     expect(ratio, `warm-cache ratio: ${ratio.toFixed(2)}× (cold=${tCold.toFixed(2)}ms, warm=${tWarm.toFixed(2)}ms)`).toBeGreaterThan(5);
   });
 });
+
+import {
+  decodeFrameWarpedWithDiagnosticsStateful,
+} from "./index";
+
+describe("decodeFrameWarpedWithDiagnosticsStateful — cache path labelling", () => {
+  it("labels the first decode 'cold'", () => {
+    const frame = buildFrame(31);
+    const state = newWarpedDecoderState();
+    const d = decodeFrameWarpedWithDiagnosticsStateful(DEFAULT_GEOMETRY, PALETTE_2BIT, frame, CELL, state);
+    expect(d.cachePath).toBe("cold");
+    expect(d.result).not.toBeNull();
+    expect(state.totalFullDetects).toBe(1);
+    expect(state.totalFastHits).toBe(0);
+  });
+
+  it("labels a repeat decode 'fast-hit'", () => {
+    const frame = buildFrame(31);
+    const state = newWarpedDecoderState();
+    decodeFrameWarpedWithDiagnosticsStateful(DEFAULT_GEOMETRY, PALETTE_2BIT, frame, CELL, state);
+    const d2 = decodeFrameWarpedWithDiagnosticsStateful(DEFAULT_GEOMETRY, PALETTE_2BIT, frame, CELL, state);
+    expect(d2.cachePath).toBe("fast-hit");
+    expect(state.totalFastHits).toBe(1);
+    expect(state.totalFullDetects).toBe(1);
+  });
+
+  it("labels a decode 'fast-miss-fallback' when the cached fiducials no longer match", () => {
+    const frame = buildFrame(31);
+    const state = newWarpedDecoderState();
+    decodeFrameWarpedWithDiagnosticsStateful(DEFAULT_GEOMETRY, PALETTE_2BIT, frame, CELL, state);
+    // Corrupt the cache so the fast path fails magic.
+    state.lastFiducials = [
+      { x: 1, y: 1 }, { x: 1, y: 1 }, { x: 1, y: 1 }, { x: 1, y: 1 },
+    ];
+    const d3 = decodeFrameWarpedWithDiagnosticsStateful(DEFAULT_GEOMETRY, PALETTE_2BIT, frame, CELL, state);
+    expect(d3.cachePath).toBe("fast-miss-fallback");
+    expect(d3.result).not.toBeNull();
+    expect(state.totalFullDetects).toBe(2);
+  });
+
+  it("rotationsAttempted on a fast-hit shows only the cached rotation", () => {
+    const frame = buildFrame(31);
+    const state = newWarpedDecoderState();
+    decodeFrameWarpedWithDiagnosticsStateful(DEFAULT_GEOMETRY, PALETTE_2BIT, frame, CELL, state);
+    const d2 = decodeFrameWarpedWithDiagnosticsStateful(DEFAULT_GEOMETRY, PALETTE_2BIT, frame, CELL, state);
+    expect(d2.rotationsAttempted.length).toBe(1);
+    expect(d2.rotationsAttempted[0]!.matched).toBe(true);
+    expect(d2.rotationsAttempted[0]!.rotation).toBe(state.lastRotation);
+  });
+});
