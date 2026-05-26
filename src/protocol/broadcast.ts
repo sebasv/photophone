@@ -90,6 +90,7 @@ export function decodeBroadcastFrame(
  */
 import { payloadCellCount, type FrameGeometry } from "./framing";
 import { PALETTE_2BIT } from "./codec";
+import { maxFrameDataBytes } from "./ecc";
 
 export function sourcePacketSizeForGeometry(
   g: FrameGeometry,
@@ -98,7 +99,6 @@ export function sourcePacketSizeForGeometry(
   const capacityCells = payloadCellCount(g);
   const bitsPerCell = Math.log2(PALETTE_2BIT.colors.length);
   const capacityBytes = Math.floor((capacityCells * bitsPerCell) / 8);
-  const rsBlocks = Math.floor(capacityBytes / 255);
-  const rsDataBytes = rsBlocks * (255 - nsym);
+  const rsDataBytes = maxFrameDataBytes(capacityBytes, nsym);
   return rsDataBytes - BROADCAST_HEADER_SIZE;
 }

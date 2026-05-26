@@ -22,7 +22,7 @@ import {
   newFountainDecoder,
   payloadCellCount,
   recoverPayload,
-  rsDecodeAll,
+  rsDecodeFrame,
   sha256Complete,
   sourcePacketSizeForGeometry,
   type BootstrapAccumulator,
@@ -50,8 +50,6 @@ const decodedOutput = document.querySelector<HTMLPreElement>("#decoded-output")!
 
 const capacityCells = payloadCellCount(DEFAULT_GEOMETRY);
 const capacityBytes = (capacityCells * 2) / 8;
-const RS_BLOCKS = Math.floor(capacityBytes / 255);
-const RS_ENCODED_BYTES = RS_BLOCKS * 255;
 const SOURCE_PACKET_SIZE = sourcePacketSizeForGeometry(DEFAULT_GEOMETRY, NSYM);
 
 interface SessionState {
@@ -155,10 +153,10 @@ function ingestOneFrameFromCamera(): void {
     return;
   }
   const allBytes = cellsToBytes(d.result.cells, PALETTE_2BIT);
-  if (allBytes.length < RS_ENCODED_BYTES) return;
+  if (allBytes.length < capacityBytes) return;
   let dataBytes: Uint8Array;
   try {
-    dataBytes = rsDecodeAll(allBytes.subarray(0, RS_ENCODED_BYTES), NSYM);
+    dataBytes = rsDecodeFrame(allBytes.subarray(0, capacityBytes), capacityBytes, NSYM);
   } catch {
     rejectCounts["rs-decode-failed"]! += 1;
     return;

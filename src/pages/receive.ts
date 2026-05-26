@@ -20,7 +20,7 @@ import {
   newReassembly,
   newWarpedDecoderState,
   payloadCellCount,
-  rsDecodeAll,
+  rsDecodeFrame,
   type DecodeFrameWarpedDiagnostics,
   type PDPCandidate,
   type Point,
@@ -48,8 +48,7 @@ const STREAM_INTERVAL_MS = 100; // 10 fps decode cadence
 
 // Reed-Solomon protection parameters. Must match the sender (send.ts).
 const NSYM = 32;
-const RS_BLOCKS = Math.floor((payloadCellCount(DEFAULT_GEOMETRY) * 2 / 8) / 255);
-const RS_ENCODED_BYTES = RS_BLOCKS * 255;
+const capacityBytes = (payloadCellCount(DEFAULT_GEOMETRY) * 2) / 8;
 
 const startButton = document.querySelector<HTMLButtonElement>("#start-camera")!;
 const captureButton = document.querySelector<HTMLButtonElement>("#capture-frame")!;
@@ -284,10 +283,10 @@ function streamTick(): void {
 function decodedWireBytes(d: DecodeFrameWarpedDiagnostics): Uint8Array | null {
   if (!d.result) return null;
   const allBytes = cellsToBytes(d.result.cells, PALETTE_2BIT);
-  if (allBytes.length < RS_ENCODED_BYTES) return null;
-  const ecc = allBytes.subarray(0, RS_ENCODED_BYTES);
+  if (allBytes.length < capacityBytes) return null;
+  const ecc = allBytes.subarray(0, capacityBytes);
   try {
-    return rsDecodeAll(ecc, NSYM);
+    return rsDecodeFrame(ecc, capacityBytes, NSYM);
   } catch {
     rejectCounts["rs-decode-failed"]! += 1;
     packetsRejected++;
@@ -463,14 +462,14 @@ function renderOutputText(d: DecodeFrameWarpedDiagnostics): void {
     return;
   }
   const allBytes = cellsToBytes(result.cells, PALETTE_2BIT);
-  if (allBytes.length < RS_ENCODED_BYTES) {
-    output.textContent = `Capture decoded only ${allBytes.length} bytes; expected at least ${RS_ENCODED_BYTES} for RS unwrap.`;
+  if (allBytes.length < capacityBytes) {
+    output.textContent = `Capture decoded only ${allBytes.length} bytes; expected at least ${capacityBytes} for RS unwrap.`;
     if (!streaming) status.textContent = "decode short";
     return;
   }
   let bytes: Uint8Array;
   try {
-    bytes = rsDecodeAll(allBytes.subarray(0, RS_ENCODED_BYTES), NSYM);
+    bytes = rsDecodeFrame(allBytes.subarray(0, capacityBytes), capacityBytes, NSYM);
   } catch (err) {
     output.textContent =
       `Reed-Solomon decode failed: ${(err as Error).message}\n\n` +

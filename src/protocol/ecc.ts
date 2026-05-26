@@ -348,6 +348,121 @@ export function rsDecode(
 
 
 // =========================================================================
+// Frame encode/decode — fills exactly `capacityBytes` with N full blocks
+// of 255 plus an optional partial last block sized to the remainder.
+// =========================================================================
+
+/**
+ * How many data bytes (across all blocks) a frame of `capacityBytes` post-
+ * RS bytes can carry, given `nsym` parity bytes per block.
+ *
+ * Layout: N full 255-byte blocks (each 255 - nsym data) + one partial
+ * block of size `remaining = capacityBytes - N*255` bytes, with
+ * `remaining - nsym` data bytes (or zero if `remaining <= nsym`, where a
+ * partial block has no room for any data).
+ *
+ * Both sides of the pipeline derive the split from `capacityBytes` and
+ * `nsym` — nothing about the partial block is transmitted on the wire.
+ */
+export function maxFrameDataBytes(capacityBytes: number, nsym: number): number {
+  if (nsym <= 0 || nsym >= 255) {
+    throw new Error(`maxFrameDataBytes: nsym must be in (0, 255), got ${nsym}`);
+  }
+  const fullBlocks = Math.floor(capacityBytes / 255);
+  const remaining = capacityBytes - fullBlocks * 255;
+  const dataPerFull = 255 - nsym;
+  const partialData = remaining > nsym ? remaining - nsym : 0;
+  return fullBlocks * dataPerFull + partialData;
+}
+
+/**
+ * Encode `msg` into exactly `capacityBytes` of RS-protected output. Uses
+ * full 255-byte blocks where possible and a partial last block to fill
+ * the remaining capacity, gaining the per-frame bytes that a "floor-to-
+ * full-blocks" layout would waste (~174 bytes per frame at the default
+ * geometry, ~21 % of the per-frame data budget).
+ *
+ * Throws if `msg.length > maxFrameDataBytes(capacityBytes, nsym)`.
+ */
+export function rsEncodeFrame(
+  msg: Uint8Array,
+  capacityBytes: number,
+  nsym: number,
+): Uint8Array {
+  const maxBytes = maxFrameDataBytes(capacityBytes, nsym);
+  if (msg.length > maxBytes) {
+    throw new Error(
+      `rsEncodeFrame: message ${msg.length} > frame capacity ${maxBytes}`,
+    );
+  }
+  const fullBlocks = Math.floor(capacityBytes / 255);
+  const remaining = capacityBytes - fullBlocks * 255;
+  const dataPerFull = 255 - nsym;
+  const partialCodewordSize = remaining > nsym ? remaining : 0;
+  const partialData = partialCodewordSize > 0 ? partialCodewordSize - nsym : 0;
+
+  const padded = new Uint8Array(maxBytes);
+  padded.set(msg);
+  const out = new Uint8Array(capacityBytes);
+
+  for (let b = 0; b < fullBlocks; b++) {
+    const chunk = padded.subarray(b * dataPerFull, (b + 1) * dataPerFull);
+    const encoded = rsEncodeBlock(chunk, nsym);
+    out.set(encoded, b * 255);
+  }
+  if (partialCodewordSize > 0) {
+    const chunkStart = fullBlocks * dataPerFull;
+    const chunk = padded.subarray(chunkStart, chunkStart + partialData);
+    const encoded = rsEncodeBlock(chunk, nsym); // codeword length = partialCodewordSize
+    out.set(encoded, fullBlocks * 255);
+  }
+  return out;
+}
+
+/**
+ * Decode an RS-encoded frame of exactly `capacityBytes` length. Returns
+ * `maxFrameDataBytes(capacityBytes, nsym)` data bytes; the caller is
+ * responsible for trimming to its own application length (the wire
+ * packet's length field, the broadcast-frame's fixed S, etc.).
+ *
+ * Throws if any block has too many errors to correct.
+ */
+export function rsDecodeFrame(
+  encoded: Uint8Array,
+  capacityBytes: number,
+  nsym: number,
+): Uint8Array {
+  if (encoded.length !== capacityBytes) {
+    throw new Error(
+      `rsDecodeFrame: encoded length ${encoded.length} !== capacity ${capacityBytes}`,
+    );
+  }
+  const fullBlocks = Math.floor(capacityBytes / 255);
+  const remaining = capacityBytes - fullBlocks * 255;
+  const dataPerFull = 255 - nsym;
+  const partialCodewordSize = remaining > nsym ? remaining : 0;
+  const partialData = partialCodewordSize > 0 ? partialCodewordSize - nsym : 0;
+  const maxBytes = fullBlocks * dataPerFull + partialData;
+
+  const out = new Uint8Array(maxBytes);
+  for (let b = 0; b < fullBlocks; b++) {
+    const block = encoded.subarray(b * 255, (b + 1) * 255);
+    const decoded = rsDecodeBlock(block, nsym);
+    out.set(decoded, b * dataPerFull);
+  }
+  if (partialCodewordSize > 0) {
+    const block = encoded.subarray(
+      fullBlocks * 255,
+      fullBlocks * 255 + partialCodewordSize,
+    );
+    const decoded = rsDecodeBlock(block, nsym);
+    out.set(decoded, fullBlocks * dataPerFull);
+  }
+  return out;
+}
+
+
+// =========================================================================
 // Wire-packet wrapper: length-prefixed Reed-Solomon for arbitrary blobs
 // =========================================================================
 
