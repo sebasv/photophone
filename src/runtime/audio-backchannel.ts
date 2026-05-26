@@ -46,6 +46,8 @@ export interface ListenerHandle {
   sampleRate: number;
   /** Number of audio samples consumed per FSK bit at that sample rate. */
   samplesPerBit: number;
+  /** Live AudioContext state ("running" / "suspended" / "closed"). */
+  contextState(): AudioContextState;
 }
 
 export interface ListenerDiagnostics {
@@ -88,6 +90,12 @@ export async function startAudioBackchannelListener(
     video: false,
   });
   const audioCtx = new AudioContext();
+  // Safari (and Safari iOS in particular) often leaves the context
+  // suspended after an awaited getUserMedia, because the original button-
+  // click gesture token doesn't survive the await. With a suspended
+  // context, AnalyserNode sees no samples and the listener silently
+  // captures zeros forever. Resume explicitly.
+  if (audioCtx.state === "suspended") await audioCtx.resume();
   const src = audioCtx.createMediaStreamSource(stream);
   const sampleRate = audioCtx.sampleRate;
   const samplesPerBit = Math.round(fsk.bitDurationSec * sampleRate);
@@ -117,6 +125,7 @@ export async function startAudioBackchannelListener(
   return {
     sampleRate,
     samplesPerBit,
+    contextState: () => audioCtx.state,
     stop(): void {
       clearInterval(handle);
       for (const track of stream.getTracks()) track.stop();

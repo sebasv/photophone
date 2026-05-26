@@ -244,7 +244,7 @@ function paintBackchannelDiagnostics(): void {
     else break;
   }
   bcDiagOutput.textContent =
-    `sr=${bcListener.sampleRate} samples/bit=${bcListener.samplesPerBit}  bits observed=${bitsObserved}\n` +
+    `ctx=${bcListener.contextState()} sr=${bcListener.sampleRate} samples/bit=${bcListener.samplesPerBit}  bits observed=${bitsObserved}\n` +
     `mic RMS:   ${lastDiag.rms.toExponential(2)}  (${rmsDb.toFixed(1)} dBFS)\n` +
     `power LOW  (${800} Hz): ${lastDiag.powerLow.toExponential(2)}  (${lowDb.toFixed(1)} dB)\n` +
     `power HIGH (${1600} Hz): ${lastDiag.powerHigh.toExponential(2)}  (${highDb.toFixed(1)} dB)\n` +
