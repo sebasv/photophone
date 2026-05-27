@@ -76,6 +76,10 @@ export interface ListenerDiagnostics {
   hasCarrier: boolean;
   /** Control-frequency Hz values used for the noise-floor estimate. */
   controlHz: ReadonlyArray<number>;
+  /** Which oversampling phase emitted this estimate (0..numPhases-1). */
+  phase: number;
+  /** How many phases the listener is rotating through. */
+  numPhases: number;
 }
 
 export interface ListenerOptions {
@@ -124,18 +128,32 @@ export async function startAudioBackchannelListener(
   const src = audioCtx.createMediaStreamSource(stream);
   const sampleRate = audioCtx.sampleRate;
   const samplesPerBit = Math.round(fsk.bitDurationSec * sampleRate);
+  // Oversampling — the worklet emits this many bit estimates per bit
+  // duration. We distribute them round-robin into NUM_PHASES separate
+  // bit buffers (one per phase offset), each with its own framing search.
+  // TX's bit-boundary phase is uncontrolled relative to ours (depends on
+  // when the AudioContext started vs when the user clicked Send), so we
+  // run all four offsets in parallel and whichever one is best-aligned
+  // decodes. This is bit clock recovery without explicit edge detection.
+  const NUM_PHASES = 4;
   const node = new AudioWorkletNode(audioCtx, "bc-demod", {
     processorOptions: {
       samplesPerBit,
       markLowHz: fsk.markLowHz,
       markHighHz: fsk.markHighHz,
       controlHz: [...gate.controlHz],
-      oversample: 1,
+      oversample: NUM_PHASES,
     },
   });
   src.connect(node);
   // No connect to destination — we don't want to play the mic input back.
-  const bitBuffer: number[] = [];
+  const phaseBuffers: number[][] = Array.from({ length: NUM_PHASES }, () => []);
+  // Dedup window: if two adjacent phases both happen to land close enough
+  // to TX's boundaries, they'll both decode the same frame within ~1
+  // emission of each other. Drop the second one.
+  const recentlyDelivered = new Map<number, number>();
+  const DEDUP_WINDOW_MS = 1000;
+  let emissionCount = 0;
   const startedAt = performance.now();
   node.port.onmessage = (event: MessageEvent) => {
     const data = event.data as {
@@ -150,10 +168,27 @@ export async function startAudioBackchannelListener(
       data.controls,
       gate,
     );
+    const phase = emissionCount % NUM_PHASES;
+    emissionCount++;
     if (gated.hasCarrier) {
-      bitBuffer.push(gated.bit);
-      if (bitBuffer.length > 2048) bitBuffer.splice(0, bitBuffer.length - 1024);
-      tryDecode(bitBuffer, opts.session, startedAt, opts.onMessage);
+      const buf = phaseBuffers[phase]!;
+      buf.push(gated.bit);
+      if (buf.length > 2048) buf.splice(0, buf.length - 1024);
+      tryDecode(buf, opts.session, startedAt, (frame) => {
+        const prevMs = recentlyDelivered.get(frame.seq);
+        if (prevMs !== undefined && frame.atMs - prevMs < DEDUP_WINDOW_MS) {
+          return;
+        }
+        recentlyDelivered.set(frame.seq, frame.atMs);
+        if (recentlyDelivered.size > 64) {
+          for (const [k, v] of recentlyDelivered) {
+            if (frame.atMs - v > DEDUP_WINDOW_MS * 5) {
+              recentlyDelivered.delete(k);
+            }
+          }
+        }
+        opts.onMessage(frame);
+      });
     }
     if (opts.onBit) {
       opts.onBit(gated.bit, {
@@ -165,6 +200,8 @@ export async function startAudioBackchannelListener(
         coherence: gated.coherence,
         hasCarrier: gated.hasCarrier,
         controlHz: gate.controlHz,
+        phase,
+        numPhases: NUM_PHASES,
       });
     }
   };

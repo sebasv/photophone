@@ -171,7 +171,9 @@ const BC_DIAG_REFRESH_MS = 100;
 const BC_DIAG_STORAGE_KEY = "photophone.bc.diagEnabled";
 let bcListener: ListenerHandle | null = null;
 const bcMessages: { atMs: number; seq: number; line: string }[] = [];
-const recentBits: number[] = [];
+// One bit history per oversampling phase. We don't know the phase count
+// at parse time, so initialize lazily on the first onBit callback.
+let recentBitsByPhase: number[][] = [];
 let pollsObserved = 0;
 let bitsAccepted = 0;
 let lastDiag: ListenerDiagnostics | null = null;
@@ -212,10 +214,14 @@ bcStartButton.addEventListener("click", async () => {
 
 function handleBackchannelBit(bit: 0 | 1, diag: ListenerDiagnostics): void {
   pollsObserved++;
+  if (recentBitsByPhase.length !== diag.numPhases) {
+    recentBitsByPhase = Array.from({ length: diag.numPhases }, () => []);
+  }
   if (diag.hasCarrier) {
-    recentBits.push(bit);
-    if (recentBits.length > BC_DIAG_BITS) {
-      recentBits.splice(0, recentBits.length - BC_DIAG_BITS);
+    const buf = recentBitsByPhase[diag.phase]!;
+    buf.push(bit);
+    if (buf.length > BC_DIAG_BITS) {
+      buf.splice(0, buf.length - BC_DIAG_BITS);
     }
     bitsAccepted++;
   }
@@ -242,17 +248,29 @@ function paintBackchannelDiagnostics(): void {
   const cohDb = 10 * Math.log10(Math.max(lastDiag.coherence, 1e-9));
   const dominantTone =
     lastDiag.powerHigh > lastDiag.powerLow ? "HIGH (1)" : "LOW (0)";
-  const bitsLine = recentBits.join("") || "(no carrier-confident bits yet)";
-  // Try to spot the FSK preamble (0xAA = 16 alternating bits) by scanning
-  // the most recent bits for the longest trailing alternating run.
-  let alternatingRun = 0;
-  for (let i = recentBits.length - 1; i > 0; i--) {
-    if (recentBits[i] !== recentBits[i - 1]) alternatingRun++;
-    else break;
+  // Score each phase by trailing-alternating-run length — that's our
+  // preamble-lock indicator. Show all phases plus the best one's bits.
+  type PhaseScore = { phase: number; bits: number[]; run: number };
+  const scores: PhaseScore[] = recentBitsByPhase.map((bits, phase) => {
+    let run = 0;
+    for (let i = bits.length - 1; i > 0; i--) {
+      if (bits[i] !== bits[i - 1]) run++;
+      else break;
+    }
+    return { phase, bits, run };
+  });
+  let best: PhaseScore = scores[0] ?? { phase: 0, bits: [], run: 0 };
+  for (const s of scores) {
+    if (s.run > best.run) best = s;
   }
+  const perPhaseRunLine = scores
+    .map((s) => `p${s.phase}=${String(s.run).padStart(2)}`)
+    .join("  ");
+  const bestBitsLine =
+    best.bits.join("") || "(no carrier-confident bits yet)";
   const carrierBadge = lastDiag.hasCarrier ? "● CARRIER" : "○ silent";
   bcDiagOutput.textContent =
-    `ctx=${bcListener.contextState()} sr=${bcListener.sampleRate} samples/bit=${bcListener.samplesPerBit} (AudioWorklet)\n` +
+    `ctx=${bcListener.contextState()} sr=${bcListener.sampleRate} samples/bit=${bcListener.samplesPerBit}  phases=${lastDiag.numPhases} (AudioWorklet)\n` +
     `polls observed=${pollsObserved}  bits with carrier=${bitsAccepted}  (${((bitsAccepted / Math.max(1, pollsObserved)) * 100).toFixed(1)}%)\n` +
     `mic RMS:   ${lastDiag.rms.toExponential(2)}  (${rmsDb.toFixed(1)} dBFS)\n` +
     `power LOW  (${1200} Hz): ${lastDiag.powerLow.toExponential(2)}  (${lowDb.toFixed(1)} dB)\n` +
@@ -264,9 +282,10 @@ function paintBackchannelDiagnostics(): void {
     `${carrierBadge}\n` +
     `→ dominant tone (if carrier): ${dominantTone}\n` +
     `\n` +
-    `last ${recentBits.length} carrier-confident bits (newest right):\n` +
-    `  ${bitsLine}\n` +
-    `trailing alternating run: ${alternatingRun} bits  (preamble = 16 alternating)`;
+    `per-phase trailing alternating run: ${perPhaseRunLine}   (preamble = 16 alternating)\n` +
+    `best phase: p${best.phase} (${best.run} alternating bits)\n` +
+    `last ${best.bits.length} carrier-confident bits on best phase (newest right):\n` +
+    `  ${bestBitsLine}`;
 }
 
 function loadBcDiagEnabled(): boolean {
