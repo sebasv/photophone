@@ -15,6 +15,7 @@ import {
   decodeFrameWarpedWithDiagnostics,
   decodeFrameWarpedWithDiagnosticsStateful,
   decodePacket,
+  encodeHello,
   ingest,
   missing,
   newReassembly,
@@ -29,6 +30,10 @@ import {
   type WarpedDecodeCachePath,
   type WarpedDecoderState,
 } from "../protocol";
+import {
+  transmitAudioBackchannelMessage,
+  transmitTestTone,
+} from "../runtime/audio-backchannel";
 
 /**
  * Receiver — single-frame capture (M4) + streaming reassembly (M6).
@@ -277,6 +282,7 @@ function streamTick(): void {
     // Enable Save as soon as there's any contiguous prefix to save.
     saveButton.disabled = false;
   }
+  maybeAutoAnnounce();
   scheduleNextStreamTick();
 }
 
@@ -379,6 +385,103 @@ saveButton.addEventListener("click", () => {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 });
+
+// -------------------------------------------------------------------------
+// Audio back-channel transmitter — integrated alongside the visual decoder
+// so the receiver can talk back without the user flipping to a separate
+// page. We send `BackChannelMessageType.Hello` frames (a small UTF-8
+// status string) — enough for the sender to confirm the link and watch
+// progress; ACK/NACK encoding for full ARQ lands later.
+// -------------------------------------------------------------------------
+
+const bcMessageInput = document.querySelector<HTMLInputElement>("#bc-message")!;
+const bcSendButton = document.querySelector<HTMLButtonElement>("#bc-send")!;
+const bcAutoToggle = document.querySelector<HTMLInputElement>("#bc-auto")!;
+const bcStatus = document.querySelector<HTMLSpanElement>("#bc-status")!;
+const bcTestToneButton = document.querySelector<HTMLButtonElement>("#bc-test-tone")!;
+const BC_AUTO_INTERVAL_MS = 2500;
+const BC_AUTO_STORAGE_KEY = "photophone.bc.autoAnnounce";
+
+let bcAudioCtx: AudioContext | null = null;
+let bcSeq = 0;
+let bcLastAutoAt = 0;
+let bcInFlight = false;
+
+bcAutoToggle.checked = loadBcAutoEnabled();
+bcAutoToggle.addEventListener("change", () => {
+  saveBcAutoEnabled(bcAutoToggle.checked);
+  // Creating the AudioContext on a user gesture so the first auto-announce
+  // during streaming isn't blocked by autoplay policy.
+  if (bcAutoToggle.checked) ensureAudioCtx();
+});
+
+bcSendButton.addEventListener("click", async () => {
+  const text = bcMessageInput.value || "hello back";
+  await sendHelloBackchannel(text);
+});
+
+bcTestToneButton.addEventListener("click", async () => {
+  const ctx = ensureAudioCtx();
+  bcStatus.textContent = "test tone: playing 2200 Hz for 1.5 s…";
+  try {
+    await transmitTestTone(ctx, 2200, 1.5);
+    bcStatus.textContent = "test tone done (1.5 s @ 2200 Hz). The sender's diagnostics should show power HIGH spiking well above LOW and the noise floor.";
+  } catch (err) {
+    bcStatus.textContent = `test tone error: ${(err as Error).message}`;
+  }
+});
+
+async function sendHelloBackchannel(text: string): Promise<void> {
+  const ctx = ensureAudioCtx();
+  bcInFlight = true;
+  try {
+    const result = await transmitAudioBackchannelMessage(ctx, {
+      session: SESSION,
+      seq: bcSeq++,
+      msg: encodeHello(text),
+    });
+    bcStatus.textContent =
+      `sent #${bcSeq - 1} "${text}" (${result.bits} bits, ${result.durationSec.toFixed(2)}s)`;
+  } catch (err) {
+    bcStatus.textContent = `bc tx error: ${(err as Error).message}`;
+  } finally {
+    bcInFlight = false;
+  }
+}
+
+function ensureAudioCtx(): AudioContext {
+  if (!bcAudioCtx) bcAudioCtx = new AudioContext();
+  return bcAudioCtx;
+}
+
+function maybeAutoAnnounce(): void {
+  if (!bcAutoToggle.checked) return;
+  if (bcInFlight) return;
+  if (!reassembly) return;
+  const now = performance.now();
+  if (now - bcLastAutoAt < BC_AUTO_INTERVAL_MS) return;
+  bcLastAutoAt = now;
+  const first = reassembly.received[0];
+  const contiguous = first && first.offset === 0 ? first.length : 0;
+  const highest = reassembly.highestByte;
+  const text = `got ${contiguous}/${highest}B (a=${packetsAccepted} r=${packetsRejected})`;
+  void sendHelloBackchannel(text);
+}
+
+function loadBcAutoEnabled(): boolean {
+  try {
+    return localStorage.getItem(BC_AUTO_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+function saveBcAutoEnabled(enabled: boolean): void {
+  try {
+    localStorage.setItem(BC_AUTO_STORAGE_KEY, enabled ? "1" : "0");
+  } catch {
+    /* localStorage unavailable; silent fallback */
+  }
+}
 
 // -------------------------------------------------------------------------
 // Rendering (overlay + output) — shared by single-capture and streaming

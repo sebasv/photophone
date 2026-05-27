@@ -28,9 +28,15 @@ export interface FskParams {
   bitDurationSec: number;
 }
 
+// 1200 / 2200 Hz pair (Bell-103-ish): neither tone is a harmonic of the
+// other, so speaker harmonic distortion on the bit-0 tone doesn't spuriously
+// excite the bit-1 Goertzel filter. 800 / 1600 Hz (the previous defaults)
+// were an octave apart, and the 2nd harmonic of 800 sits exactly on 1600 —
+// in practice both Goertzel bins lit up identically and the bit decision
+// became a coin toss.
 export const DEFAULT_FSK_PARAMS: FskParams = {
-  markLowHz: 800,
-  markHighHz: 1600,
+  markLowHz: 1200,
+  markHighHz: 2200,
   bitDurationSec: 0.01, // 100 baud — audible, easy to debug
 };
 
@@ -150,6 +156,130 @@ export function demodBit(
   const p0 = goertzelPower(samples, sampleRateHz, params.markLowHz);
   const p1 = goertzelPower(samples, sampleRateHz, params.markHighHz);
   return p1 > p0 ? 1 : 0;
+}
+
+/**
+ * Gated demodulation: in addition to the bit decision, estimate whether
+ * the sample window actually contained a carrier tone. Used by the live
+ * audio path to suppress random bits during silent intervals (where
+ * `demodBit` would still emit 0/1 based on whichever ambient-noise bin
+ * happens to be higher).
+ *
+ * Noise floor is the median of Goertzel power at `controlHz` — bins
+ * chosen to not contain either mark tone, its harmonics, or the
+ * harmonics of the other mark. A median is robust to one rogue control
+ * bin sitting on a hum or interferer.
+ */
+export interface DemodGateParams {
+  /**
+   * Frequencies (Hz) at which to sample for the noise-floor estimate.
+   * Should be at least 2; 3 is a good default. Pick bins clear of the
+   * mark tones and their first few harmonics.
+   */
+  controlHz: ReadonlyArray<number>;
+  /** Multiplicative SNR threshold: `max(p0,p1) > floor × this`. */
+  snrThreshold: number;
+  /**
+   * Tone-pair coherence threshold: `max(p0,p1) > min(p0,p1) × this`.
+   * Real FSK at the mic shows one mark much stronger than the other; a
+   * broadband transient (drum on the desk, door slam, hand clap) excites
+   * both mark bins simultaneously. Requiring a coherent dominant tone
+   * rejects those false positives.
+   */
+  coherenceThreshold: number;
+  /**
+   * Absolute floor: `max(p0,p1) > this`. Guards against false
+   * carrier-detect when *everything* is near zero and the SNR/coherence
+   * ratios become meaningless (small / small ≈ random).
+   */
+  absoluteMin: number;
+}
+
+export const DEFAULT_DEMOD_GATE: DemodGateParams = {
+  // 600 / 1700 / 3000 Hz: below the mark band, between the marks (not a
+  // harmonic of either 1200 or 2200), and well above either mark's first
+  // few harmonics. Together they sample the noise across the relevant
+  // spectrum.
+  controlHz: [600, 1700, 3000],
+  snrThreshold: 4, // ~6 dB headroom over the floor estimate
+  coherenceThreshold: 3, // dominant mark must be ~5 dB above the other
+  // Bumped from 1e-6: at the mic noise-floor end of the range, the floor
+  // estimate can itself be in 1e-6 territory and the ratio gets noisy.
+  // 1e-5 puts us above the typical bin-sum floor on a quiet laptop mic.
+  absoluteMin: 1e-5,
+};
+
+export interface DemodGateResult {
+  bit: 0 | 1;
+  hasCarrier: boolean;
+  /** Median of `controlPowers`. */
+  noiseFloor: number;
+  /** `max(p0,p1) / noiseFloor`, or +Infinity if floor=0. */
+  snr: number;
+  /** `max(p0,p1) / min(p0,p1)`, or +Infinity if min=0. */
+  coherence: number;
+}
+
+/**
+ * Apply the carrier-detect gate to already-computed bin powers. Lives
+ * separately from `demodBitGated` so the AudioWorklet (which computes
+ * powers in the audio thread) and the in-process sample-based path can
+ * share the exact same gate logic.
+ */
+export function applyDemodGate(
+  powerLow: number,
+  powerHigh: number,
+  controlPowers: ReadonlyArray<number>,
+  gate: DemodGateParams = DEFAULT_DEMOD_GATE,
+): DemodGateResult {
+  const noiseFloor = median(controlPowers);
+  const peak = Math.max(powerLow, powerHigh);
+  const valley = Math.min(powerLow, powerHigh);
+  const snr = noiseFloor > 0 ? peak / noiseFloor : Number.POSITIVE_INFINITY;
+  const coherence = valley > 0 ? peak / valley : Number.POSITIVE_INFINITY;
+  const hasCarrier =
+    peak > gate.absoluteMin &&
+    snr > gate.snrThreshold &&
+    coherence > gate.coherenceThreshold;
+  return {
+    bit: powerHigh > powerLow ? 1 : 0,
+    hasCarrier,
+    noiseFloor,
+    snr,
+    coherence,
+  };
+}
+
+export interface GatedBit extends DemodGateResult {
+  powerLow: number;
+  powerHigh: number;
+}
+
+export function demodBitGated(
+  samples: ArrayLike<number>,
+  sampleRateHz: number,
+  params: FskParams = DEFAULT_FSK_PARAMS,
+  gate: DemodGateParams = DEFAULT_DEMOD_GATE,
+): GatedBit {
+  const powerLow = goertzelPower(samples, sampleRateHz, params.markLowHz);
+  const powerHigh = goertzelPower(samples, sampleRateHz, params.markHighHz);
+  const controlPowers = gate.controlHz.map((f) =>
+    goertzelPower(samples, sampleRateHz, f),
+  );
+  return {
+    ...applyDemodGate(powerLow, powerHigh, controlPowers, gate),
+    powerLow,
+    powerHigh,
+  };
+}
+
+function median(values: ReadonlyArray<number>): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[mid - 1]! + sorted[mid]!) / 2
+    : sorted[mid]!;
 }
 
 /**

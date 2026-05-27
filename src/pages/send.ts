@@ -20,6 +20,13 @@ import {
   maxFrameDataBytes,
   type SessionInfo,
 } from "../protocol";
+import {
+  describeBackchannelMessage,
+  startAudioBackchannelListener,
+  type DecodedBackchannelFrame,
+  type ListenerDiagnostics,
+  type ListenerHandle,
+} from "../runtime/audio-backchannel";
 
 /**
  * Sender — M4 single-frame render + M6 continuous streaming + M8 wire-byte
@@ -140,6 +147,176 @@ function stopStreaming(): void {
     streamIntervalId = null;
   }
   streamButton.textContent = "Start streaming";
+}
+
+// -------------------------------------------------------------------------
+// Audio back-channel listener — integrated with the sender so the user
+// doesn't have to flip between pages to see what the receiver is saying.
+// The visual data path (sender → receiver) uses screen + camera; the
+// back-channel runs in the opposite direction via mic + speaker. Same
+// session id so the receiver's transmitter and our listener line up
+// without configuration.
+// -------------------------------------------------------------------------
+
+const bcStartButton = document.querySelector<HTMLButtonElement>("#bc-start")!;
+const bcStatus = document.querySelector<HTMLSpanElement>("#bc-status")!;
+const bcLog = document.querySelector<HTMLPreElement>("#bc-log")!;
+const bcDiagToggle = document.querySelector<HTMLInputElement>("#bc-diag")!;
+const bcDiagPanel = document.querySelector<HTMLElement>("#bc-diag-panel")!;
+const bcDiagOutput = document.querySelector<HTMLPreElement>("#bc-diag-output")!;
+const BC_LOG_MAX = 20;
+const BC_DIAG_BITS = 128;
+const BC_DIAG_REFRESH_MS = 100;
+const BC_DIAG_STORAGE_KEY = "photophone.bc.diagEnabled";
+let bcListener: ListenerHandle | null = null;
+const bcMessages: { atMs: number; seq: number; line: string }[] = [];
+// One bit history per oversampling phase. We don't know the phase count
+// at parse time, so initialize lazily on the first onBit callback.
+let recentBitsByPhase: number[][] = [];
+let pollsObserved = 0;
+let bitsAccepted = 0;
+let lastDiag: ListenerDiagnostics | null = null;
+let lastDiagPaintAt = 0;
+
+bcDiagToggle.checked = loadBcDiagEnabled();
+bcDiagPanel.hidden = !bcDiagToggle.checked;
+bcDiagToggle.addEventListener("change", () => {
+  saveBcDiagEnabled(bcDiagToggle.checked);
+  bcDiagPanel.hidden = !bcDiagToggle.checked;
+});
+
+bcStartButton.addEventListener("click", async () => {
+  if (bcListener) {
+    bcListener.stop();
+    bcListener = null;
+    bcStartButton.textContent = "Listen for back-channel";
+    bcStatus.textContent = "back-channel idle";
+    return;
+  }
+  bcStartButton.disabled = true;
+  bcStatus.textContent = "requesting microphone…";
+  try {
+    bcListener = await startAudioBackchannelListener({
+      session: SESSION,
+      onMessage: handleBackchannelMessage,
+      onBit: handleBackchannelBit,
+    });
+    bcStatus.textContent =
+      `listening (sr=${bcListener.sampleRate}, ${bcListener.samplesPerBit} samples/bit)`;
+    bcStartButton.textContent = "Stop listening";
+  } catch (err) {
+    bcStatus.textContent = `mic error: ${(err as Error).message}`;
+  } finally {
+    bcStartButton.disabled = false;
+  }
+});
+
+function handleBackchannelBit(bit: 0 | 1, diag: ListenerDiagnostics): void {
+  pollsObserved++;
+  if (recentBitsByPhase.length !== diag.numPhases) {
+    recentBitsByPhase = Array.from({ length: diag.numPhases }, () => []);
+  }
+  if (diag.hasCarrier) {
+    const buf = recentBitsByPhase[diag.phase]!;
+    buf.push(bit);
+    if (buf.length > BC_DIAG_BITS) {
+      buf.splice(0, buf.length - BC_DIAG_BITS);
+    }
+    bitsAccepted++;
+  }
+  lastDiag = diag;
+  if (!bcDiagToggle.checked) return;
+  const now = performance.now();
+  if (now - lastDiagPaintAt < BC_DIAG_REFRESH_MS) return;
+  lastDiagPaintAt = now;
+  paintBackchannelDiagnostics();
+}
+
+function paintBackchannelDiagnostics(): void {
+  if (!lastDiag || !bcListener) {
+    bcDiagOutput.textContent = "(no diagnostics yet — start listening first)";
+    return;
+  }
+  // Power readings come out of Goertzel as a sum-of-squared accumulator;
+  // a log scale is the only sane way to read them by eye.
+  const rmsDb = 20 * Math.log10(Math.max(lastDiag.rms, 1e-9));
+  const lowDb = 10 * Math.log10(Math.max(lastDiag.powerLow, 1e-9));
+  const highDb = 10 * Math.log10(Math.max(lastDiag.powerHigh, 1e-9));
+  const floorDb = 10 * Math.log10(Math.max(lastDiag.noiseFloor, 1e-9));
+  const snrDb = 10 * Math.log10(Math.max(lastDiag.snr, 1e-9));
+  const cohDb = 10 * Math.log10(Math.max(lastDiag.coherence, 1e-9));
+  const dominantTone =
+    lastDiag.powerHigh > lastDiag.powerLow ? "HIGH (1)" : "LOW (0)";
+  // Score each phase by trailing-alternating-run length — that's our
+  // preamble-lock indicator. Show all phases plus the best one's bits.
+  type PhaseScore = { phase: number; bits: number[]; run: number };
+  const scores: PhaseScore[] = recentBitsByPhase.map((bits, phase) => {
+    let run = 0;
+    for (let i = bits.length - 1; i > 0; i--) {
+      if (bits[i] !== bits[i - 1]) run++;
+      else break;
+    }
+    return { phase, bits, run };
+  });
+  let best: PhaseScore = scores[0] ?? { phase: 0, bits: [], run: 0 };
+  for (const s of scores) {
+    if (s.run > best.run) best = s;
+  }
+  const perPhaseRunLine = scores
+    .map((s) => `p${s.phase}=${String(s.run).padStart(2)}`)
+    .join("  ");
+  const bestBitsLine =
+    best.bits.join("") || "(no carrier-confident bits yet)";
+  const carrierBadge = lastDiag.hasCarrier ? "● CARRIER" : "○ silent";
+  bcDiagOutput.textContent =
+    `ctx=${bcListener.contextState()} sr=${bcListener.sampleRate} samples/bit=${bcListener.samplesPerBit}  phases=${lastDiag.numPhases} (AudioWorklet)\n` +
+    `polls observed=${pollsObserved}  bits with carrier=${bitsAccepted}  (${((bitsAccepted / Math.max(1, pollsObserved)) * 100).toFixed(1)}%)\n` +
+    `mic RMS:   ${lastDiag.rms.toExponential(2)}  (${rmsDb.toFixed(1)} dBFS)\n` +
+    `power LOW  (${1200} Hz): ${lastDiag.powerLow.toExponential(2)}  (${lowDb.toFixed(1)} dB)\n` +
+    `power HIGH (${2200} Hz): ${lastDiag.powerHigh.toExponential(2)}  (${highDb.toFixed(1)} dB)\n` +
+    `noise floor (median of [${lastDiag.controlHz.join(", ")}] Hz): ` +
+    `${lastDiag.noiseFloor.toExponential(2)}  (${floorDb.toFixed(1)} dB)\n` +
+    `SNR (peak/floor): ${lastDiag.snr.toExponential(2)}  (${snrDb.toFixed(1)} dB)\n` +
+    `coherence (peak/valley): ${lastDiag.coherence.toExponential(2)}  (${cohDb.toFixed(1)} dB)\n` +
+    `${carrierBadge}\n` +
+    `→ dominant tone (if carrier): ${dominantTone}\n` +
+    `\n` +
+    `per-phase trailing alternating run: ${perPhaseRunLine}   (preamble = 16 alternating)\n` +
+    `best phase: p${best.phase} (${best.run} alternating bits)\n` +
+    `last ${best.bits.length} carrier-confident bits on best phase (newest right):\n` +
+    `  ${bestBitsLine}`;
+}
+
+function loadBcDiagEnabled(): boolean {
+  try {
+    return localStorage.getItem(BC_DIAG_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+function saveBcDiagEnabled(enabled: boolean): void {
+  try {
+    localStorage.setItem(BC_DIAG_STORAGE_KEY, enabled ? "1" : "0");
+  } catch {
+    /* localStorage unavailable; silent fallback */
+  }
+}
+
+function handleBackchannelMessage(frame: DecodedBackchannelFrame): void {
+  const line = describeBackchannelMessage(frame.msg);
+  bcMessages.push({ atMs: frame.atMs, seq: frame.seq, line });
+  if (bcMessages.length > BC_LOG_MAX) {
+    bcMessages.splice(0, bcMessages.length - BC_LOG_MAX);
+  }
+  bcLog.textContent = bcMessages
+    .map((m) => `[+${formatMs(m.atMs)}, seq ${m.seq}] ${m.line}`)
+    .join("\n");
+  bcStatus.textContent = `last: ${line}`;
+}
+
+function formatMs(ms: number): string {
+  if (ms < 1000) return `${ms} ms`;
+  return `${(ms / 1000).toFixed(1)} s`;
 }
 
 function renderWirePacket(wirePacket: Uint8Array): void {

@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_DEMOD_GATE,
   DEFAULT_FSK_PARAMS,
   bitsToBytes,
   bytesToBits,
   crc16,
+  demodBitGated,
   demodBitstream,
   fskFrame,
   fskUnframe,
@@ -68,5 +70,57 @@ describe("synthSignal -> demodBitstream round-trip", () => {
     const recoveredBits = demodBitstream(signal, sampleRate);
     const recoveredFrame = bitsToBytes(recoveredBits);
     expect(fskUnframe(recoveredFrame)).toEqual(payload);
+  });
+});
+
+describe("demodBitGated", () => {
+  const sampleRate = 44100;
+  const samplesPerBit = Math.round(DEFAULT_FSK_PARAMS.bitDurationSec * sampleRate);
+
+  it("reports hasCarrier=true on a clean mark-high tone", () => {
+    const signal = synthSignal(new Uint8Array([1]), sampleRate);
+    const result = demodBitGated(signal.subarray(0, samplesPerBit), sampleRate);
+    expect(result.bit).toBe(1);
+    expect(result.hasCarrier).toBe(true);
+    expect(result.snr).toBeGreaterThan(DEFAULT_DEMOD_GATE.snrThreshold);
+  });
+
+  it("reports hasCarrier=false on pure noise", () => {
+    // Pseudo-random low-amplitude noise, no concentrated tone energy
+    // anywhere in the bin grid. We seed with a fixed value to keep the
+    // test deterministic.
+    let seed = 0x12345;
+    const noise = new Float32Array(samplesPerBit);
+    for (let i = 0; i < noise.length; i++) {
+      // simple LCG → [-amp, amp]
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      noise[i] = ((seed / 0xffffffff) * 2 - 1) * 1e-3;
+    }
+    const result = demodBitGated(noise, sampleRate);
+    expect(result.hasCarrier).toBe(false);
+  });
+
+  it("reports hasCarrier=false on silence (below absoluteMin)", () => {
+    const silent = new Float32Array(samplesPerBit);
+    const result = demodBitGated(silent, sampleRate);
+    expect(result.hasCarrier).toBe(false);
+  });
+
+  it("rejects mixed-tone broadband signal via coherence check", () => {
+    // Simulate something like a drum hit on the desk: strong energy at
+    // both mark frequencies simultaneously. SNR vs floor would pass, but
+    // the coherence (peak/valley) ratio is near 1 so the gate should
+    // reject this as not-real-FSK.
+    const samples = new Float32Array(samplesPerBit);
+    for (let i = 0; i < samples.length; i++) {
+      const t = i / sampleRate;
+      samples[i] =
+        0.3 * Math.sin(2 * Math.PI * DEFAULT_FSK_PARAMS.markLowHz * t) +
+        0.3 * Math.sin(2 * Math.PI * DEFAULT_FSK_PARAMS.markHighHz * t);
+    }
+    const result = demodBitGated(samples, sampleRate);
+    // Both bins should be roughly equal → coherence near 1.
+    expect(result.coherence).toBeLessThan(DEFAULT_DEMOD_GATE.coherenceThreshold);
+    expect(result.hasCarrier).toBe(false);
   });
 });

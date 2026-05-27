@@ -40,6 +40,25 @@
         <canvas id="palette-swatches" class="palette-swatches" hidden></canvas>
         <pre id="diagnostics-output"></pre>
       </section>
+      <section class="back-channel">
+        <h2>Audio back-channel</h2>
+        <p class="tagline">Send FSK messages back to the sender (the sender
+          needs to be listening). Auto-announce sends a progress beacon
+          every couple of seconds while receiving.</p>
+        <div class="controls">
+          <label class="size-input">
+            <span>Message</span>
+            <input type="text" id="bc-message" value="hello back" />
+          </label>
+          <button id="bc-send">Send hello</button>
+          <button id="bc-test-tone">Test tone (1.5 s @ 2200 Hz)</button>
+          <label class="diagnostics-toggle">
+            <input type="checkbox" id="bc-auto" />
+            <span>Auto-announce progress while receiving</span>
+          </label>
+          <span id="bc-status" class="status">back-channel idle</span>
+        </div>
+      </section>
     </main>
     <script type="module" src="/src/pages/receive.ts"></script>
   </body>
